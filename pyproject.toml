@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sctrange"
+version = "0.4.0"
+description = "Range-aware evaluation and training utilities for synthetic CT (SynthRAD2025)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.10",
+    "torch>=2.1",
+    "SimpleITK>=2.3",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dose = ["pyradplan>=0.2.8"]
+dev = ["pytest>=8", "nbformat>=5.9", "nbclient>=0.9", "nbconvert>=7", "ipykernel>=6"]
+
+[project.scripts]
+sctrange-split = "sctrange.split:main"
+sctrange-train = "sctrange.training:main"
+sctrange-download = "sctrange.download:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::RuntimeWarning:pyRadPlan.*"]

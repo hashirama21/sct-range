@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "registered": "2026-10-22",
+  "question": "Do out-of-fold sCT errors on SynthRAD2025 development cases carry excess low-frequency energy along the beam, relative to the same errors shuffled?",
+  "primary_source": "l1_hu",
+  "window_mm": 64.0,
+  "cutoff_cycles_per_mm": 0.05,
+  "spectrum_angles_deg": [
+    0.0,
+    60.0,
+    120.0
+  ],
+  "go": {
+    "median_lf_excess_along_min": 1.5,
+    "median_target_global_ratio_min": 1.2
+  },
+  "weak": {
+    "median_lf_excess_along_min": 1.15
+  },
+  "secondary": {
+    "bias_region": "AB",
+    "bias_pair": [
+      "l1_hu",
+      "l2_spr"
+    ],
+    "bias_column": "target_mean_signed_mm",
+    "bias_alternative": "greater",
+    "tail_column": "target_cvar_mm"
+  }
+}
