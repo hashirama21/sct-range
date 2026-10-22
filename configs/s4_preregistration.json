@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "registered": "2026-10-22",
+  "question": "At a strictly matched budget, does a range-aware objective (R5, R6) lower the tail of the range error to the distal target edge relative to the SPR-space Bayes act (R3), and does it do more than a per-tissue SPR bias correction of R3 (R4)?",
+  "primary_metric": "target_cvar_mm",
+  "reference_arm": "R3",
+  "control_arm": "R4",
+  "method_arms": ["R5", "R6"],
+  "mae_relative_tolerance": 0.05,
+  "alpha": 0.05,
+  "aggregation": "per-case metrics averaged over seeds before testing; one-sided paired Wilcoxon over development cases; Holm over the four comparisons",
+  "verdicts": {
+    "GAIN": "some method arm beats R3 and R4 with MAE within tolerance",
+    "BIAS CORRECTION SUFFICES": "some method arm beats R3 with MAE within tolerance, none beats R4",
+    "NO GAIN": "otherwise"
+  },
+  "note": "Range proxy only. The gamma-proton part of go/no-go 2 requires the S6 dosimetry subset."
+}

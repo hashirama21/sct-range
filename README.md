@@ -15,7 +15,19 @@ pip install -e ".[dose,dev]"
 pytest
 ```
 
-`pyradplan` is optional for the package and required for the HLUT equivalence and Siddon checks.
+`pyradplan` is optional for the package and required for the HLUT equivalence and Siddon checks (the S1 notebook
+reports them as not run without it).
+
+Every notebook starts with a setup cell that installs `sctrange` itself, so no manual step is needed:
+
+- inside a clone, it runs `pip install -e ".[dose]"` on that clone (only when `sctrange` is missing or installed from
+  elsewhere), so the notebook always executes the repository's code, local edits included;
+- opened on its own (Colab, another machine), it downloads the repository from
+  [GitHub](https://github.com/hashirama21/sct-range) as an archive (no git needed), then installs it the same way.
+  `SCTRANGE_REF` selects a branch, tag or commit (default `main`), `SCTRANGE_HOME` the destination, and
+  `SCTRANGE_REINSTALL=1` forces a reinstall.
+
+The cell then checks that the imported `sctrange` is the repository's copy.
 SynthRAD2025 dosimetry used pyRadPlan 0.2.8; its default HLUT is identical to that of 0.5.0.
 
 ## Data
@@ -94,12 +106,18 @@ never loaded. The cache takes roughly 60 MB per case.
 for seed in 0 1 2; do
   for arm in R1 R2 R3 R5 R6; do
     sctrange-train --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-      --cache-dir outputs/s4/cache --out outputs/s4/seed$seed --arm $arm --task 1 --folds 5 --seed $seed
+      --cache-dir outputs/s4/cache --out outputs/s4/runs/seed$seed --arm $arm --task 1 --folds 5 --seed $seed
   done
   sctrange-train --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-    --cache-dir outputs/s4/cache --out outputs/s4/seed$seed --arm R4 --task 1
+    --cache-dir outputs/s4/cache --out outputs/s4/runs/seed$seed --arm R4 --task 1
 done
+jupyter nbconvert --to notebook --execute --inplace notebooks/s4_regression_arms.ipynb
 ```
+
+`notebooks/s4_regression_arms.ipynb` evaluates every arm and seed, draws the MAE × CVaR Pareto front (plan figure 4),
+checks the calibration of the R6 risk head and applies the rule fixed in `configs/s4_preregistration.json` (one-sided
+paired Wilcoxon of target CVaR90 against R3 and R4, Holm-adjusted, MAE within 5 %). Without the dataset it trains
+tiny models on the fixture in about five minutes on a CPU.
 
 Every arm shares the backbone, data, folds, number of steps and seed; the range and risk terms only add projector
 work per step. λ = 1e-4 mm⁻² and β = 1e-2 are starting values that put the extra terms at the scale of the SPR loss;

@@ -285,6 +285,41 @@ def plot_beam_spectra(spectra: dict[str, list], cutoff: float) -> plt.Figure:
     return fig
 
 
+ARM_ROLES = {"R1": "point loss in HU", "R2": "point loss in HU", "R3": "SPR Bayes act", "R4": "SPR Bayes act",
+             "R5": "range-aware", "R6": "range-aware"}
+
+
+def plot_arm_pareto(summary: pd.DataFrame, x: str = "mae_hu", y: str = "target_cvar_mm") -> plt.Figure:
+    """Median image error against median range-error tail, one point per arm (plan figure 4).
+
+    ``summary`` is indexed by arm with ``x`` and ``y`` columns and optional ``{x,y}_q25`` / ``{x,y}_q75`` for the
+    interquartile whiskers. Colour encodes the role of the arm (three validated slots), the marker separates the two
+    arms of a role, and every point carries a direct label, so identity never rests on colour alone.
+    """
+    roles = list(dict.fromkeys(ARM_ROLES[arm] for arm in summary.index))
+    _check_series(len(roles), SERIES)
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    seen: dict[str, int] = {}
+    for arm, row in summary.iterrows():
+        role = ARM_ROLES[arm]
+        color = SERIES[roles.index(role)]
+        marker = ("o", "s")[seen.get(role, 0) % 2]
+        seen[role] = seen.get(role, 0) + 1
+        if f"{x}_q25" in summary:
+            ax.plot([row[f"{x}_q25"], row[f"{x}_q75"]], [row[y], row[y]], color=color, linewidth=1.2, alpha=0.6)
+            ax.plot([row[x], row[x]], [row[f"{y}_q25"], row[f"{y}_q75"]], color=color, linewidth=1.2, alpha=0.6)
+        ax.plot(row[x], row[y], marker, color=color, markersize=9, markeredgecolor=SURFACE, markeredgewidth=2,
+                linestyle="none", label=role if seen[role] == 1 else None, zorder=3)
+        ax.annotate(arm, (row[x], row[y]), xytext=(7, 6), textcoords="offset points", color=INK, fontsize=9,
+                    fontweight="bold")
+    ax.set_xlabel("median MAE in body (HU)")
+    ax.set_ylabel("median CVaR90 |ΔWET| to distal edge (mm)")
+    ax.set_title("Image error vs range-error tail per arm (lower left is better)")
+    ax.legend(title="arm role")
+    fig.tight_layout()
+    return fig
+
+
 def plot_signed_bias(frame: pd.DataFrame, column: str = "target_mean_signed_mm") -> plt.Figure:
     """Mean signed range error per region (bars) and per case (dots), one colour per source."""
     sources = list(frame["source"].unique())

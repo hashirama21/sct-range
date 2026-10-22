@@ -152,6 +152,34 @@ def test_paired_test_detects_shift(rng: np.random.Generator) -> None:
     assert result["cases"] == 20 and result["p_value"] < 1e-3
 
 
+def test_holm_adjustment() -> None:
+    from sctrange.diagnostics import holm
+
+    adjusted = holm({"a": 0.01, "b": 0.04, "c": 0.03, "d": float("nan")})
+    assert adjusted["a"] == pytest.approx(0.03) and adjusted["c"] == pytest.approx(0.06)
+    assert adjusted["b"] == pytest.approx(0.06) and np.isnan(adjusted["d"])
+
+
+def _arm_frame(rng: np.random.Generator, r5_gain: float, r4_gain: float, n: int = 30) -> pd.DataFrame:
+    rows = []
+    for index in range(n):
+        base, mae = rng.normal(10, 1), rng.normal(60, 3)
+        for arm, cvar in (("R3", base), ("R4", base - r4_gain), ("R5", base - r5_gain), ("R6", base)):
+            rows.append({"case_id": f"c{index}", "region": "AB", "source": arm,
+                         "target_cvar_mm": cvar + rng.normal(0, 0.05), "mae_hu": mae + rng.normal(0, 0.1)})
+    return pd.DataFrame(rows)
+
+
+def test_arm_decision_rule(rng: np.random.Generator) -> None:
+    from sctrange.diagnostics import decide_arms
+
+    prereg = Preregistration.load(REPO / "configs" / "s4_preregistration.json")
+    assert decide_arms(_arm_frame(rng, r5_gain=1.0, r4_gain=0.0), prereg)["verdict"] == "GAIN"
+    assert decide_arms(_arm_frame(rng, r5_gain=1.0, r4_gain=1.5), prereg)["verdict"] == "BIAS CORRECTION SUFFICES"
+    assert decide_arms(_arm_frame(rng, r5_gain=0.0, r4_gain=0.0), prereg)["verdict"] == "NO GAIN"
+    assert decide_arms(_arm_frame(rng, 1.0, 0.0).query("source != 'R5' and source != 'R6'"), prereg)["verdict"] == "NOT EVALUATED"
+
+
 def test_spectrum_angles_separate_along_from_across(hlut: HLUT, rng: np.random.Generator) -> None:
     from sctrange.diagnostics import diagnose_case
 

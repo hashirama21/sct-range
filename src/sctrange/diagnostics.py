@@ -156,6 +156,55 @@ def decide(frame: pd.DataFrame, prereg: Preregistration) -> dict[str, object]:
             "median_target_global_ratio": ratio, "preregistration_sha256": prereg.fingerprint}
 
 
+def holm(p_values: dict[str, float]) -> dict[str, float]:
+    """Holm-Bonferroni adjusted p-values (NaN entries are left out of the family and returned as NaN)."""
+    finite = sorted((p, name) for name, p in p_values.items() if np.isfinite(p))
+    adjusted, running = {name: float("nan") for name in p_values}, 0.0
+    for rank, (p, name) in enumerate(finite):
+        running = max(running, min(1.0, (len(finite) - rank) * p))
+        adjusted[name] = running
+    return adjusted
+
+
+def decide_arms(frame: pd.DataFrame, prereg: Preregistration) -> dict[str, object]:
+    """Pre-registered S4-S5 rule (``configs/s4_preregistration.json``) on per-case metrics, one row per case and arm.
+
+    Each method arm is compared with the reference (R3) and with the bias-correction control (R4) by one-sided paired
+    Wilcoxon tests on the primary metric, Holm-adjusted over the whole family; its MAE must stay within the tolerance.
+    """
+    rule = prereg.raw
+    metric, reference, control = rule["primary_metric"], rule["reference_arm"], rule["control_arm"]
+    tolerance, alpha = float(rule["mae_relative_tolerance"]), float(rule["alpha"])
+    raw, details = {}, {}
+    for arm in rule["method_arms"]:
+        for comparator in (reference, control):
+            key = f"{arm} < {comparator}"
+            raw[key] = paired_test(frame, metric, arm, comparator, alternative="less")["p_value"]
+    adjusted = holm(raw)
+    wide_mae = frame.pivot_table(index="case_id", columns="source", values="mae_hu")
+    for arm in rule["method_arms"]:
+        both = wide_mae[[arm, reference]].dropna() if {arm, reference} <= set(wide_mae) else pd.DataFrame()
+        relative = float(np.median(both[arm] / both[reference] - 1.0)) if len(both) else float("nan")
+        details[arm] = {
+            "p_vs_reference_holm": adjusted[f"{arm} < {reference}"],
+            "p_vs_control_holm": adjusted[f"{arm} < {control}"],
+            "median_relative_mae_change": relative,
+            "mae_within_tolerance": bool(abs(relative) <= tolerance) if np.isfinite(relative) else False,
+        }
+    beats_reference = [a for a, d in details.items() if d["p_vs_reference_holm"] < alpha and d["mae_within_tolerance"]]
+    beats_control = [a for a in beats_reference if details[a]["p_vs_control_holm"] < alpha]
+    if not any(np.isfinite(p) for p in raw.values()):
+        verdict = "NOT EVALUATED"
+    elif beats_control:
+        verdict = "GAIN"
+    elif beats_reference:
+        verdict = "BIAS CORRECTION SUFFICES"
+    else:
+        verdict = "NO GAIN"
+    return {"verdict": verdict, "metric": metric, "arms": details, "raw_p_values": raw,
+            "preregistration_sha256": prereg.fingerprint}
+
+
 def paired_test(frame: pd.DataFrame, column: str, first: str, second: str, region: str | None = None,
                 alternative: str = "two-sided") -> dict[str, float]:
     """Wilcoxon signed-rank test of ``column`` for ``first - second`` over cases evaluated with both sources."""
