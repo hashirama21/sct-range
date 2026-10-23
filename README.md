@@ -15,12 +15,12 @@ SynthRAD2025 data, frozen split, training, evaluation, verdict — runs from the
 
 | Notebook | Plan | What it does | Hardware | Open |
 |---|---|---|---|---|
-| `s1_harness` | S1 | HLUT and projector checks, data integrity, frozen split, range diagnostics on the real data | CPU is enough | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) |
-| `s2_synthetic_benchmark` | S2 | numerical checks of `docs/theory.md` with a known posterior (no dataset) | CPU, ~30 s | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) |
+| `s1_harness` | S1 | data integrity, frozen split, HLUT and projector checks on a real patient, range diagnostics on the real data | CPU is enough | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) |
+| `s2_synthetic_benchmark` | S2 | checks of `docs/theory.md` with a known posterior, then its identities on real patients | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) |
 | `s3_real_diagnostic` | S3 | cross-fitted L1-HU and L2-SPR models, beam spectra, pre-registered go/no-go 1 | GPU (T4 or 2 × T4) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s3_real_diagnostic.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s3_real_diagnostic.ipynb) |
 | `s4_regression_arms` | S4–S5 | arms R1–R6 over three seeds, Pareto front, R6 risk calibration, pre-registered verdict | GPU (T4 or 2 × T4) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s4_regression_arms.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s4_regression_arms.ipynb) |
 
-Run S1 first (with both tasks): it freezes the local test split that S3 and S4 verify.
+Run S1 first (with both tasks): it freezes the local test split that S2, S3 and S4 verify.
 
 | Platform | Dataset and cache | Outputs | Settings |
 |---|---|---|---|
@@ -87,11 +87,13 @@ re-extracts zips already present.
    export SCT_PREDICTION_ROOT=/path/to/predictions     # optional, <case_id>.mha
    jupyter nbconvert --to notebook --execute --inplace notebooks/s1_harness.ipynb
    ```
-   The notebooks S1, S3 and S4 run on the real data only. When `SYNTHRAD2025_ROOT` (default `data/synthrad2025`)
+   Every notebook runs on the real data. When `SYNTHRAD2025_ROOT` (default `data/synthrad2025`)
    holds no case, they download and prepare it first; `SCT_DOWNLOAD=0` makes them stop with an error instead.
-   `SCT_TASKS` (S1, default `1,2`) and `SCT_TASK` (S3, S4) select the tasks; `SCT_MAX_CASES` limits the S1 diagnostics.
-   S2 alone stays synthetic: its checks need the exact posterior, which no patient dataset provides. The unit tests
-   use small analytic phantoms (`sctrange.phantoms`) so that they run without the 27 GB dataset.
+   `SCT_TASKS` (S1, default `1,2`) and `SCT_TASK` (S2, S3, S4) select the tasks; `SCT_MAX_CASES` limits the S1 diagnostics
+   and the S2 real-data section (`N_CASES`). Only two kinds of check use constructed inputs, because they need an exact answer: the analytic geometry checks
+   of S1 (disk chords, target segments; the projector is then compared with the Siddon tracer on a patient) and
+   sections 1–6 of S2 (a known posterior, which no patient dataset provides). The unit tests use small analytic
+   phantoms (`sctrange.phantoms`) so that they run without the 27 GB dataset.
 2. Freeze the local test split once, on the real data, and commit it (the first S1 run on the real data creates it):
    ```bash
    sctrange-split --data-root "$SYNTHRAD2025_ROOT" --out splits/synthrad2025_local_test.json
@@ -102,8 +104,10 @@ re-extracts zips already present.
 ## Week 2 (S2)
 
 `notebooks/s2_synthetic_benchmark.ipynb` checks every statement of `docs/theory.md` against an explicit criterion on
-synthetic data with a known posterior, and writes the verdicts to `outputs/s2/s2_report.json`. It needs no dataset and
-runs in about 30 s on a laptop CPU:
+synthetic data with a known posterior (sections 1–6, about 30 s on a laptop CPU), then checks the statements that are
+identities (Propositions 1, 1′, 2, 3) on the SPR errors of real patients and measures the coherence of real errors
+(section 7: development cases of the frozen split, bulk-density baseline and any S3/S4 prediction). The verdicts go to
+`outputs/s2/s2_report.json`, the real-data table to `outputs/s2/real_identities.csv`:
 
 ```bash
 jupyter nbconvert --to notebook --execute --inplace notebooks/s2_synthetic_benchmark.ipynb

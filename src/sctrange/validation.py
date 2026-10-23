@@ -1,15 +1,20 @@
-"""Verification of the range projector against analytic geometry and pyRadPlan's Siddon tracer."""
+"""Verification of the range projector against analytic geometry and pyRadPlan's Siddon tracer.
+
+Analytic checks need an exact reference and run on disks; the Siddon comparison, the gradient check and the timing
+also run on real patient anatomy (``*_case`` functions, ``ct``/``mask`` arguments).
+"""
 
 from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
 
+from .data import bounding_box, central_slab
 from .hlut import HLUT
 from .losses import range_mse
 from .phantoms import chord_length, disk
@@ -72,70 +77,124 @@ def heterogeneous_phantom(shape_yx: tuple[int, int] = (101, 121)) -> tuple[np.nd
     return hu, (body > 0.5).astype(np.float64)
 
 
-def siddon_relative_errors(hlut: HLUT, angles_deg: Sequence[float] = (0.0, 30.0, 75.0, 140.0),
-                           shape_yx: tuple[int, int] = (101, 121), stride: int = 4,
-                           max_offset: float = 38.0) -> pd.DataFrame:
-    """Relative WET difference to pyRadPlan's Siddon tracer on a voxelised heterogeneous phantom."""
+def _siddon_compare(spr: np.ndarray, angles_deg: Sequence[float], spacing_mm: float,
+                    rays: Callable[[int, np.ndarray, np.ndarray], np.ndarray]) -> pd.DataFrame:
+    """Projector integrals of a 2-D SPR map versus pyRadPlan's Siddon tracer, on the rays chosen by
+    ``rays(angle_index, offsets_px, projector_mm)``."""
     import SimpleITK as sitk
     from pyRadPlan.raytracer import RayTracerSiddon
 
+    shape_yx = spr.shape
     centre = _centre(shape_yx)
-    hu, body = heterogeneous_phantom(shape_yx)
-    volume = np.repeat((hlut.numpy(hu) * body)[None], 3, axis=0)
+    volume = np.repeat(spr[None].astype(np.float64), 3, axis=0)
     image = sitk.GetImageFromArray(volume)
-    image.SetSpacing((1.0, 1.0, 1.0))
+    image.SetSpacing((spacing_mm,) * 3)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         tracer = RayTracerSiddon([image])
-    projector = ParallelBeamProjector(shape_yx, angles_deg, spacing_mm=1.0)
+    projector = ParallelBeamProjector(shape_yx, angles_deg, spacing_mm=spacing_mm)
     integrals = projector.integrate(torch.from_numpy(volume), _ALL)
-    isocentre = np.array([centre[1], centre[0], 1.0])
+    isocentre = spacing_mm * np.array([centre[1], centre[0], 1.0])
 
     rows = []
     for index, angle in enumerate(projector.angles_deg):
         geometry = projector.ray_geometry(index)
         offsets = projector.ray_offsets(index, centre)
-        for column in np.flatnonzero(np.abs(offsets) < max_offset)[::stride]:
+        projected = integrals[index, 1].numpy()
+        for column in rays(index, offsets, projected):
             start = geometry.origins_xy[column] - 10 * geometry.direction_xy
             stop = geometry.origins_xy[column] + (geometry.n_samples + 10) * geometry.direction_xy
-            source = np.array([*start, 1.0]) - isocentre
-            target = np.array([*stop, 1.0]) - isocentre
+            source = spacing_mm * np.array([*start, 1.0]) - isocentre
+            target = spacing_mm * np.array([*stop, 1.0]) - isocentre
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 warnings.simplefilter("ignore", UserWarning)
                 _, lengths, rho, _, _ = tracer.trace_ray(isocentre, source, target)
             reference = float(np.nansum(lengths * rho[0]))
-            projected = integrals[index, 1, column].item()
             rows.append({"angle_deg": angle, "offset_px": float(offsets[column]), "siddon_mm": reference,
-                         "projector_mm": projected, "relative_error": abs(projected - reference) / reference})
+                         "projector_mm": float(projected[column]),
+                         "relative_error": abs(float(projected[column]) - reference) / reference})
     return pd.DataFrame(rows)
 
 
-def gradcheck_range_loss(hlut: HLUT, seed: int = 0) -> bool:
-    """Finite-difference check of the range loss gradient in float64."""
+def siddon_relative_errors(hlut: HLUT, angles_deg: Sequence[float] = (0.0, 30.0, 75.0, 140.0),
+                           shape_yx: tuple[int, int] = (101, 121), stride: int = 4,
+                           max_offset: float = 38.0) -> pd.DataFrame:
+    """Relative WET difference to pyRadPlan's Siddon tracer on a voxelised heterogeneous phantom."""
+    hu, body = heterogeneous_phantom(shape_yx)
+    return _siddon_compare(hlut.numpy(hu) * body, angles_deg, 1.0,
+                           lambda _, offsets, __: np.flatnonzero(np.abs(offsets) < max_offset)[::stride])
+
+
+def siddon_relative_errors_case(hlut: HLUT, ct: np.ndarray, mask: np.ndarray, spacing_mm: float,
+                                angles_deg: Sequence[float] = (0.0, 60.0, 135.0), stride: int = 8,
+                                min_wet_mm: float = 20.0) -> pd.DataFrame:
+    """Relative WET difference to pyRadPlan's Siddon tracer on the real anatomy of one patient.
+
+    The axial slice with the largest body area is cropped to the body; every ``stride``-th ray crossing at least
+    ``min_wet_mm`` of water-equivalent tissue is compared (shorter rays only graze the skin).
+    """
+    slab = central_slab(mask, 1)
+    box = bounding_box(mask[slab])[1:]
+    hu, body = ct[slab][0][box], (mask[slab][0][box] > 0.5)
+    return _siddon_compare(hlut.numpy(hu) * body, angles_deg, spacing_mm,
+                           lambda _, __, projected: np.flatnonzero(projected >= min_wet_mm)[::stride])
+
+
+def _away_from_nodes(hu: torch.Tensor, nodes: np.ndarray, distance: float = 0.05) -> torch.Tensor:
+    """Shift values lying within ``distance`` HU of an HLUT node, where the table has no derivative."""
+    near = (hu.unsqueeze(-1) - torch.as_tensor(nodes, dtype=hu.dtype)).abs().amin(dim=-1) < distance
+    return hu + 2 * distance * near.to(hu.dtype)
+
+
+def gradcheck_range_loss(hlut: HLUT, seed: int = 0, ct: np.ndarray | None = None,
+                         mask: np.ndarray | None = None) -> bool:
+    """Finite-difference check of the range loss gradient in float64.
+
+    With ``ct`` and ``mask`` (a real case), the check runs on a 17 × 19 patch of that patient's anatomy at the
+    body centroid of its largest slice; otherwise on a uniform soft-tissue disk.
+    """
     rng = np.random.default_rng(seed)
     shape = (17, 19)
-    body = torch.from_numpy(disk(shape, (8.0, 9.0), 7.0)[None] > 0.5).double()
-    ct = torch.from_numpy(rng.uniform(-80, 80, size=(1, *shape)))
-    sct = (ct + torch.from_numpy(rng.uniform(5, 30, size=(1, *shape)))).requires_grad_(True)
+    if ct is None or mask is None:
+        body = torch.from_numpy(disk(shape, (8.0, 9.0), 7.0)[None] > 0.5).double()
+        reference = torch.from_numpy(rng.uniform(-80, 80, size=(1, *shape)))
+    else:
+        slab = central_slab(mask, 1)
+        centre = np.argwhere(mask[slab][0] > 0.5).mean(0).round().astype(int)
+        y0 = int(np.clip(centre[0] - shape[0] // 2, 0, mask.shape[1] - shape[0]))
+        x0 = int(np.clip(centre[1] - shape[1] // 2, 0, mask.shape[2] - shape[1]))
+        patch = (slab, slice(y0, y0 + shape[0]), slice(x0, x0 + shape[1]))
+        body = torch.from_numpy(mask[patch] > 0.5).double()
+        reference = torch.from_numpy(ct[patch].astype(np.float64))
+    noise = torch.from_numpy(rng.uniform(5, 30, size=(1, *shape)))
+    sct = _away_from_nodes(reference + noise, hlut.hu).requires_grad_(True)
     projector = ParallelBeamProjector(shape, (0.0, 37.0, 101.0), spacing_mm=1.0)
     weights, valid = projector.segment_weights(body)
 
     def loss(x: torch.Tensor) -> torch.Tensor:
-        return range_mse(x, ct, body, projector, hlut, weights, valid)
+        return range_mse(x, reference, body, projector, hlut, weights, valid)
 
     return bool(torch.autograd.gradcheck(loss, (sct,), eps=1e-3, atol=1e-6))
 
 
-def benchmark_range_loss(hlut: HLUT, shape_zyx: tuple[int, int, int], angles_deg: Sequence[float],
-                         device: str = "cpu", repeats: int = 3) -> dict[str, float]:
-    """Wall-clock time of one range-loss forward and backward pass (ms, best of ``repeats``)."""
-    z, y, x = shape_zyx
-    body = torch.from_numpy(disk((y, x), _centre((y, x)), 0.45 * min(y, x))[None] > 0.5).float()
-    body = body.expand(z, -1, -1).contiguous().to(device)
-    ct = (torch.randn(z, y, x, device=device) * 100.0) * body
-    sct = (ct + 20.0 * torch.randn_like(ct)).requires_grad_(True)
-    projector = ParallelBeamProjector((y, x), angles_deg, spacing_mm=1.0, device=device)
+def benchmark_range_loss(hlut: HLUT, ct: np.ndarray, mask: np.ndarray, sct: np.ndarray, spacing_mm: float,
+                         angles_deg: Sequence[float], n_slices: int = 16, device: str = "cpu",
+                         repeats: int = 3) -> dict[str, float]:
+    """Wall-clock time of one range-loss forward and backward pass on a real case (ms, best of ``repeats``).
+
+    The ``n_slices`` slices around the largest body section are cropped to the body, as in training.
+    """
+    slab = central_slab(mask, n_slices)
+    box = (slab, *bounding_box(mask[slab])[1:])
+
+    def tensor(array: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(np.ascontiguousarray(array[box]), dtype=torch.float32, device=device)
+
+    ct, body = tensor(ct), tensor(mask)
+    sct = tensor(sct).requires_grad_(True)
+    z, y, x = ct.shape
+    projector = ParallelBeamProjector((y, x), angles_deg, spacing_mm=spacing_mm, device=device)
     weights, valid = projector.segment_weights(body)
 
     def synchronise() -> None:

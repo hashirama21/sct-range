@@ -124,6 +124,13 @@ def bounding_box(mask: np.ndarray, margin: int = 4) -> tuple[slice, ...]:
     )
 
 
+def central_slab(mask: np.ndarray, n_slices: int) -> slice:
+    """``n_slices`` consecutive axial slices centred on the slice with the largest body area."""
+    centre = int((mask > 0.5).sum(axis=(1, 2)).argmax())
+    start = min(max(centre - n_slices // 2, 0), max(mask.shape[0] - n_slices, 0))
+    return slice(start, start + n_slices)
+
+
 def bulk_density_sct(mask: np.ndarray, inside_hu: float = 0.0, outside_hu: float = -1000.0) -> np.ndarray:
     """SynthRAD2025 baseline: water inside the body contour, air outside."""
     return np.where(mask > 0.5, inside_hu, outside_hu).astype(np.float32)
