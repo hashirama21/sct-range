@@ -5,6 +5,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 
+import pandas as pd
 import pytest
 
 from sctrange import download
@@ -103,6 +104,47 @@ def test_extract_and_validate_nested_archive(tmp_path: Path) -> None:
     assert manifest["ok"].all() and (root / "manifest.csv").exists()
     (root / "Task1" / "AB" / "1ABA002" / "mr.mha").unlink()
     assert validate_dataset(root, ("1",)).set_index("case_id").loc["1ABA002", "problems"] == "missing mr"
+
+
+def test_ensure_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from sctrange.download import ensure_dataset
+
+    with pytest.raises(FileNotFoundError, match="no SynthRAD2025 case"):
+        ensure_dataset(tmp_path / "empty", download=False)
+    calls = []
+    monkeypatch.setattr(download, "prepare", lambda root, tasks, **_: calls.append(tuple(tasks)) or write_fixture_dataset(
+        root, regions=("AB",), centers=("A",), cases_per_stratum=1, shape_yx=(16, 16), n_slices=1))
+    root = ensure_dataset(tmp_path / "real", tasks=("1",))
+    assert calls == [("1",)] and ensure_dataset(root, tasks=("1",)) == root and len(calls) == 1
+    with pytest.raises(FileNotFoundError, match="task"):
+        ensure_dataset(root, tasks=("1", "2"))
+
+
+def test_prepare_processes_archives_one_by_one_and_never_refetches(server, tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    served, base = server
+    remotes = []
+    for task, region in (("1", "AB"), ("2", "HN")):
+        source = tmp_path / f"source{task}"
+        write_fixture_dataset(source, regions=(region,), centers=("A",), cases_per_stratum=1, shape_yx=(16, 16),
+                              n_slices=1)
+        archive = tmp_path / f"synthRAD2025_Task{task}_Train.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            for path in source.rglob("*.mha"):
+                relative = path.relative_to(source).as_posix().replace("Task1/", f"Task{task}/")
+                relative = relative.replace(f"/1{region}", f"/{task}{region}").replace("mr.mha", "mr.mha" if task == "1"
+                                                                                       else "cbct.mha")
+                bundle.write(path, f"top/{relative}")
+        remotes.append(_remote(served, base, archive.name, archive.read_bytes()))
+    monkeypatch.setattr(download, "list_record_files", lambda record: remotes)
+    root = tmp_path / "dataset"
+
+    manifest = download.prepare(root, ("1", "2"), keep_archives=False)
+    assert sorted(manifest["case_id"]) == ["1ABA001", "2HNA001"] and manifest["ok"].all()
+    assert not list((root / "archives").glob("*.zip"))
+    monkeypatch.setattr(download, "download_file", lambda *a, **k: pytest.fail("extracted archive downloaded again"))
+    download.prepare(root, ("1", "2"), keep_archives=False)
+    assert sorted(pd.read_csv(root / "manifest.csv")["case_id"]) == ["1ABA001", "2HNA001"]
 
 
 def test_extract_refuses_path_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

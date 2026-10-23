@@ -7,6 +7,36 @@ water-equivalent range error, ray by ray, using the same HU → SPR conversion a
 engine of the SynthRAD2025 evaluation (pyRadPlan).
 
 
+## Notebooks
+
+Click a badge to open a notebook directly on Colab or Kaggle, then run all cells: the first cell installs `sctrange`
+from this repository, the parameters cell (a form on Colab) sets the run, and every later step — download of the real
+SynthRAD2025 data, frozen split, training, evaluation, verdict — runs from the notebook.
+
+| Notebook | Plan | What it does | Hardware | Open |
+|---|---|---|---|---|
+| `s1_harness` | S1 | HLUT and projector checks, data integrity, frozen split, range diagnostics on the real data | CPU is enough | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s1_harness.ipynb) |
+| `s2_synthetic_benchmark` | S2 | numerical checks of `docs/theory.md` with a known posterior (no dataset) | CPU, ~30 s | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s2_synthetic_benchmark.ipynb) |
+| `s3_real_diagnostic` | S3 | cross-fitted L1-HU and L2-SPR models, beam spectra, pre-registered go/no-go 1 | GPU (T4 or 2 × T4) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s3_real_diagnostic.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s3_real_diagnostic.ipynb) |
+| `s4_regression_arms` | S4–S5 | arms R1–R6 over three seeds, Pareto front, R6 risk calibration, pre-registered verdict | GPU (T4 or 2 × T4) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s4_regression_arms.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s4_regression_arms.ipynb) |
+
+Run S1 first (with both tasks): it freezes the local test split that S3 and S4 verify.
+
+| Platform | Dataset and cache | Outputs | Settings |
+|---|---|---|---|
+| Colab | `/content/data`, `/content/cache` | Google Drive `MyDrive/sct-range/outputs` (`USE_DRIVE`) | *Runtime → Change runtime type → T4 GPU* |
+| Kaggle | `/kaggle/tmp/data`, `/kaggle/tmp/cache` | `/kaggle/working/outputs` only | *Accelerator → GPU T4 × 2*, *Internet on* |
+| local | `data/synthrad2025`, `outputs/` | `outputs/` | every visible GPU |
+
+- **Two GPUs** (Kaggle T4 × 2): missing folds train in parallel, one process per GPU; prediction runs on the first.
+- **T4**: no native bfloat16, so training uses float16 autocast with loss scaling (bfloat16 on Ampere and newer).
+- **Sessions end**: every fold is checkpointed in the outputs; rerunning the notebook resumes where it stopped. On
+  Colab the outputs stay in Drive. On Kaggle, *Save Version* keeps `/kaggle/working`; to continue, add that version's
+  output as an input (*Add Input → Your Work*): when `/kaggle/working/outputs` is empty, the notebook copies the
+  attached `outputs/` back before starting. Archives are deleted after extraction on Colab and Kaggle; predictions are
+  stored as int16 HU to fit the 20 GB of `/kaggle/working`.
+- The data download takes about 27 GB from Zenodo; it resumes after an interruption.
+
 ## Install
 
 ```bash
@@ -57,9 +87,12 @@ re-extracts zips already present.
    export SCT_PREDICTION_ROOT=/path/to/predictions     # optional, <case_id>.mha
    jupyter nbconvert --to notebook --execute --inplace notebooks/s1_harness.ipynb
    ```
-   Without `SYNTHRAD2025_ROOT`, the notebook generates a synthetic fixture so every cell runs;
-   fixture numbers validate the pipeline only.
-2. Freeze the local test split once, on the real data, and commit it:
+   The notebooks S1, S3 and S4 run on the real data only. When `SYNTHRAD2025_ROOT` (default `data/synthrad2025`)
+   holds no case, they download and prepare it first; `SCT_DOWNLOAD=0` makes them stop with an error instead.
+   `SCT_TASKS` (S1, default `1,2`) and `SCT_TASK` (S3, S4) select the tasks; `SCT_MAX_CASES` limits the S1 diagnostics.
+   S2 alone stays synthetic: its checks need the exact posterior, which no patient dataset provides. The unit tests
+   use small analytic phantoms (`sctrange.phantoms`) so that they run without the 27 GB dataset.
+2. Freeze the local test split once, on the real data, and commit it (the first S1 run on the real data creates it):
    ```bash
    sctrange-split --data-root "$SYNTHRAD2025_ROOT" --out splits/synthrad2025_local_test.json
    git add splits/ && git commit -m "Freeze SynthRAD2025 local test split"
@@ -116,8 +149,8 @@ jupyter nbconvert --to notebook --execute --inplace notebooks/s4_regression_arms
 
 `notebooks/s4_regression_arms.ipynb` evaluates every arm and seed, draws the MAE × CVaR Pareto front (plan figure 4),
 checks the calibration of the R6 risk head and applies the rule fixed in `configs/s4_preregistration.json` (one-sided
-paired Wilcoxon of target CVaR90 against R3 and R4, Holm-adjusted, MAE within 5 %). Without the dataset it trains
-tiny models on the fixture in about five minutes on a CPU.
+paired Wilcoxon of target CVaR90 against R3 and R4, Holm-adjusted, MAE within 5 %). It stops with a clear message
+until the arms have been trained.
 
 Every arm shares the backbone, data, folds, number of steps and seed; the range and risk terms only add projector
 work per step. λ = 1e-4 mm⁻² and β = 1e-2 are starting values that put the extra terms at the scale of the SPR loss;

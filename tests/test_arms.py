@@ -179,7 +179,38 @@ def test_r4_cli_requires_r3(fixture_root: Path, tmp_path: Path) -> None:
               "--cache-dir", str(tmp_path / "cache"), "--out", str(tmp_path / "runs"), "--arm", "R4"])
 
 
-def test_build_model_initial_outputs(hlut: HLUT) -> None:
+def test_autocast_dtype_falls_back_to_float16_without_native_bfloat16(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sctrange.training import autocast_dtype
+
+    assert autocast_dtype(torch.device("cpu")) is None
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (7, 5))  # T4
+    assert autocast_dtype(torch.device("cuda:1")) is torch.float16
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))  # A100
+    assert autocast_dtype(torch.device("cuda:0")) is torch.bfloat16
+
+
+def test_parallel_folds_match_the_sequential_run(fixture_root: Path, hlut: HLUT) -> None:
+    records = discover_cases(fixture_root / "data")
+    cache = VolumeCache(fixture_root / "cache")
+    cache.build(records)
+    config = arm_config("R3", **{**TINY, "steps": 6, "log_every": 3})
+    sequential = fixture_root / "runs" / "sequential"
+    parallel = fixture_root / "runs" / "parallel"
+    crossfit(records, cache, config, hlut, 2, sequential)
+    crossfit(records, cache, config, hlut, 2, parallel, devices=["cpu", "cpu"])
+    history = pd.read_csv(parallel / "history.csv")
+    assert set(history["fold"]) == {0, 1} and set(history["device"]) == {"cpu"}
+    for record in records:
+        a = read_volume(sequential / "predictions" / f"{record.case_id}.mha").array
+        b = read_volume(parallel / "predictions" / f"{record.case_id}.mha").array
+        np.testing.assert_array_equal(a, b)
+    import SimpleITK as sitk
+
+    stored = sitk.ReadImage(str(parallel / "predictions" / f"{records[0].case_id}.mha"))
+    assert stored.GetPixelID() == sitk.sitkInt16
+
+
+def test_build_model_initial_outputs() -> None:
     model = build_model(arm_config("R6", **TINY))
     with torch.no_grad():
         output = model(torch.zeros(1, 4, 16, 16))

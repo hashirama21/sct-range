@@ -18,6 +18,7 @@ import pandas as pd
 from .data import CaseRecord, load_case, read_volume, write_volume
 from .hlut import HLUT
 from .metrics import TISSUE_EDGES_HU
+from .normalization import CT_RANGE_HU
 
 
 def tissue_classes(hu: np.ndarray, edges_hu: Sequence[float] = TISSUE_EDGES_HU) -> np.ndarray:
@@ -79,7 +80,8 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
         volume = read_volume(source_dir / "predictions" / f"{record.case_id}.mha")
         mask = load_case(record, ("mask",))["mask"].array
         corrected = apply_bias(volume.array, mask, offsets[folds[record.case_id]], hlut, edges_hu)
-        write_volume(corrected, output_dir / "predictions" / f"{record.case_id}.mha", like=volume)
+        hu = np.clip(np.rint(corrected), *CT_RANGE_HU).astype(np.int16)  # same storage as crossfit predictions
+        write_volume(hu, output_dir / "predictions" / f"{record.case_id}.mha", like=volume)
 
     frame = pd.DataFrame.from_dict(offsets, orient="index", columns=labels).rename_axis("fold")
     pd.read_csv(source_dir / "folds.csv").to_csv(output_dir / "folds.csv", index=False)

@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 import numpy as np
 import pandas as pd
 
-from .data import CASE_ID_PATTERN, SOURCE_BY_TASK, CaseRecord, discover_cases
+from .data import CASE_ID_PATTERN, CaseRecord, discover_cases
 
 ZENODO_API = "https://zenodo.org/api/records/{record}"
 TRAINING_RECORD = "15373853"
@@ -64,10 +64,19 @@ def _open(url: str, headers: dict[str, str] | None = None, timeout: float = 60.0
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def list_record_files(record: str = TRAINING_RECORD, api: str = ZENODO_API) -> list[RemoteFile]:
-    """Files of a public Zenodo record, from its REST API entry."""
-    with _open(api.format(record=record)) as response:
-        payload = json.load(response)
+def list_record_files(record: str = TRAINING_RECORD, api: str = ZENODO_API, retries: int = 6) -> list[RemoteFile]:
+    """Files of a public Zenodo record, from its REST API entry (retried on network errors, e.g. flaky DNS)."""
+    for attempt in range(retries + 1):
+        try:
+            with _open(api.format(record=record)) as response:
+                payload = json.load(response)
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code < 500 or attempt == retries:
+                raise
+            wait = min(2**attempt, 30)
+            print(f"Zenodo API: {error!s}; retrying in {wait} s", file=sys.stderr)
+            time.sleep(wait)
     files = []
     for entry in payload.get("files", []):
         checksum = entry.get("checksum", "")
@@ -271,46 +280,90 @@ def check_case(record: CaseRecord) -> CaseCheck:
 
 
 def validate_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2")) -> pd.DataFrame:
-    """Check every case of the requested tasks and write ``<root>/manifest.csv``."""
+    """Check every case of the requested tasks; update ``<root>/manifest.csv``, keeping rows of other tasks."""
     tasks = set(tasks)
     records = [r for r in discover_cases(root) if r.task in tasks]
     frame = pd.DataFrame([{**asdict(c), "ok": c.ok} for c in map(check_case, records)])
+    path = Path(root) / "manifest.csv"
     if not frame.empty:
-        frame.to_csv(Path(root) / "manifest.csv", index=False)
-    return frame
+        if path.exists():
+            previous = pd.read_csv(path, dtype={"task": str, "case_id": str}, keep_default_na=False)
+            previous["ok"] = previous["ok"].astype(str).str.lower() == "true"
+            frame = pd.concat([previous[~previous["task"].isin(tasks)], frame], ignore_index=True)
+        frame.sort_values("case_id").to_csv(path, index=False)
+    return frame[frame["task"].isin(tasks)] if not frame.empty else frame
+
+
+def _extracted_marker(root: Path, remote: RemoteFile) -> Path:
+    return root / _TASK_DIR[remote.task] / f".extracted-{remote.md5 or remote.size}"
 
 
 def prepare(root: str | Path, tasks: Iterable[str] = ("1", "2"), record: str = TRAINING_RECORD,
             keep_archives: bool = True, skip_download: bool = False, skip_validation: bool = False) -> pd.DataFrame:
-    """Full pipeline for the requested tasks; returns the manifest (empty if validation is skipped)."""
+    """Full pipeline for the requested tasks; returns the manifest (empty if validation is skipped).
+
+    Archives are processed one at a time (download, MD5, extract, optionally delete), so that with
+    ``keep_archives=False`` the disk only ever holds one archive next to the extracted cases. A marker per archive
+    records a completed extraction, so a deleted archive is never downloaded again.
+    """
     root = Path(root)
     tasks = tuple(sorted(set(tasks)))
     archives = root / "archives"
     if skip_download:
-        selected = [(path, next((t for t, name in _TASK_DIR.items() if name.lower() in path.name.lower()), None))
-                    for path in sorted(archives.glob("*.zip"))]
-        selected = [(path, task) for path, task in selected if task in tasks]
+        for path in sorted(archives.glob("*.zip")):
+            task = next((t for t, name in _TASK_DIR.items() if name.lower() in path.name.lower()), None)
+            if task in tasks:
+                print(f"extracting {path.name}: {extract_archive(path, root, task)} files written", file=sys.stderr)
     else:
         remote = [f for f in list_record_files(record) if f.key.endswith(".zip") and f.task in tasks]
         if not remote:
             raise RuntimeError(f"no archive for tasks {tasks} in record {record}")
-        pending = sum(f.size for f in remote if not (archives / f.key).exists())
+        pending = [f for f in remote if not _extracted_marker(root, f).exists()]
         archives.mkdir(parents=True, exist_ok=True)
+        # extracted .mha are already compressed, so a case takes about as much space as its share of the archive
+        needed = (sum(f.size for f in pending) + (max((f.size for f in pending), default=0) if not keep_archives
+                                                  else sum(f.size for f in pending)))
         free = shutil.disk_usage(archives).free
-        # archives plus extracted content (stored .mha are already compressed, so roughly the same size)
-        if free < 2 * pending + sum(f.size for f in remote if (archives / f.key).exists()):
-            print(f"warning: {free / 2**30:.1f} GiB free; about {2 * pending / 2**30:.1f} GiB needed", file=sys.stderr)
-        selected = [(download_file(f, archives / f.key), f.task) for f in remote]
-
-    for path, task in selected:
-        print(f"extracting {path.name}: {extract_archive(path, root, task)} files written", file=sys.stderr)
-        if not keep_archives:
-            path.unlink()
+        if free < needed:
+            print(f"warning: {free / 2**30:.1f} GiB free; about {needed / 2**30:.1f} GiB needed", file=sys.stderr)
+        for remote_file in pending:
+            path = download_file(remote_file, archives / remote_file.key)
+            written = extract_archive(path, root, remote_file.task)
+            print(f"extracted {path.name}: {written} files written", file=sys.stderr)
+            _extracted_marker(root, remote_file).write_text(f"{remote_file.key}\n")
+            if not keep_archives:
+                path.unlink()
 
     if skip_validation:
         return pd.DataFrame()
-    manifest = validate_dataset(root, tasks)
-    return manifest
+    return validate_dataset(root, tasks)
+
+
+def has_cases(root: str | Path) -> bool:
+    root = Path(root)
+    return root.exists() and next(root.rglob("ct.mha"), None) is not None
+
+
+def ensure_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2"), download: bool = True,
+                   keep_archives: bool = True) -> Path:
+    """Return ``root`` once it holds the real SynthRAD2025 cases of ``tasks``, downloading the missing tasks.
+
+    Archives already in ``<root>/archives`` are reused and interrupted downloads resume. With ``download=False`` a
+    missing task raises instead.
+    """
+    root = Path(root)
+    tasks = tuple(sorted(set(tasks)))
+    present = {record.task for record in discover_cases(root)} if root.exists() else set()
+    missing = [task for task in tasks if task not in present]
+    if missing:
+        if not download:
+            raise FileNotFoundError(f"no SynthRAD2025 case of task(s) {', '.join(missing)} under {root}; run "
+                                    f"`sctrange-download --root {root}` or allow the download")
+        prepare(root, missing, keep_archives=keep_archives)
+        present = {record.task for record in discover_cases(root)}
+        if still := [task for task in missing if task not in present]:
+            raise FileNotFoundError(f"{root} holds no case of task(s) {', '.join(still)} after preparation")
+    return root
 
 
 def main(argv: list[str] | None = None) -> None:

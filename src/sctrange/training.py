@@ -20,8 +20,11 @@ import argparse
 import hashlib
 import json
 import math
+import multiprocessing
 import time
 from collections import defaultdict
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -35,7 +38,7 @@ from .data import CaseRecord, discover_cases, write_volume
 from .hlut import HLUT
 from .losses import fz_upper_tail_loss, ray_risk
 from .models import UNet2d
-from .normalization import OUTSIDE_HU, decode_ct, encode_ct
+from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .projection import ParallelBeamProjector
 from .split import load_split
 
@@ -246,6 +249,14 @@ def build_model(config: TrainConfig) -> UNet2d:
     return model
 
 
+def autocast_dtype(device: torch.device) -> torch.dtype | None:
+    """Mixed-precision dtype for ``device``: bfloat16 where the GPU supports it natively (compute capability 8.0+),
+    float16 otherwise (e.g. T4), ``None`` on CPU. float16 needs loss scaling, bfloat16 does not."""
+    if device.type != "cuda":
+        return None
+    return torch.bfloat16 if torch.cuda.get_device_capability(device) >= (8, 0) else torch.float16
+
+
 def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT) -> tuple[UNet2d, pd.DataFrame]:
     """Train one model; returns it in eval mode with the logged history."""
     torch.manual_seed(config.seed)
@@ -256,20 +267,23 @@ def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT) -> tup
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: _schedule(step, config))
     sampler = PatchSampler(cases, config, rng)
-    use_amp = config.amp and device.type == "cuda"
+    amp_dtype = autocast_dtype(device) if config.amp else None
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
 
     history, running, start = [], defaultdict(list), time.perf_counter()
     model.train()
     for step in range(config.steps):
         inputs, targets, masks = (tensor.to(device, non_blocking=True) for tensor in sampler.batch())
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+        with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
             output = model(inputs)
         angles = beam_angles(config, angle_rng) if config.uses_projector else ()
         loss, parts = training_objective(output, targets, masks, config, hlut, angles, sampler.spacing_mm)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
         running["loss"].append(loss.detach())
         for name, value in parts.items():
@@ -348,16 +362,49 @@ def _load_checkpoint(path: Path, config: TrainConfig) -> UNet2d:
     return model.eval()
 
 
+def visible_devices(default: str = "cpu") -> list[str]:
+    """Every visible GPU (``cuda:0``, ``cuda:1`` on a 2 x T4 machine), else ``[default]``."""
+    return [f"cuda:{index}" for index in range(torch.cuda.device_count())] or [default]
+
+
+def train_fold(cache: VolumeCache, case_ids: list[str], config: TrainConfig, hlut: HLUT, fold: int,
+               checkpoint: str | Path, device: str) -> pd.DataFrame:
+    """Train the model of one fold on ``device`` and save its checkpoint; returns the history.
+
+    Top-level and argument-picklable so that folds can run in parallel processes, one per GPU.
+    ``config`` is the run configuration; the fold's model uses seed ``config.seed + fold``.
+    """
+    cases = [cache.load(case_id) for case_id in case_ids]
+    model, history = train_model(cases, replace(config, seed=config.seed + fold, device=device), hlut)
+    temporary = Path(checkpoint).with_suffix(".pt.tmp")
+    torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold}, temporary)
+    temporary.replace(checkpoint)
+    return history.assign(fold=fold, device=device)
+
+
+def _append_history(path: Path, history: pd.DataFrame) -> None:
+    previous = pd.read_csv(path) if path.exists() else pd.DataFrame()
+    pd.concat([previous, history], ignore_index=True).to_csv(path, index=False)
+
+
+def _write_prediction(sct: np.ndarray, case: CachedCase, path: Path) -> None:
+    """Out-of-fold sCT as int16 HU (half the size of float32; the reference CT is integer HU in the same range)."""
+    hu = np.clip(np.rint(uncrop(case, sct)), *CT_RANGE_HU).astype(np.int16)
+    write_volume(hu, path, spacing=case.spacing, origin=case.origin, direction=case.direction)
+
+
 def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig, hlut: HLUT, n_folds: int,
-             output_dir: str | Path) -> pd.DataFrame:
+             output_dir: str | Path, devices: Sequence[str] | None = None) -> pd.DataFrame:
     """Train one model per fold on the other folds; write out-of-fold predictions and checkpoints.
 
-    Layout: ``<output_dir>/predictions/<case_id>.mha``, ``fold<k>.pt``, ``history.csv``, ``folds.csv``,
+    Layout: ``<output_dir>/predictions/<case_id>.mha`` (int16 HU), ``fold<k>.pt``, ``history.csv``, ``folds.csv``,
     ``config.json``, and ``risk/<case_id>_{var,excess}.mha`` when the model has a risk head. Folds whose checkpoint
     exists are reused (after checking that it was trained with the same configuration), so interrupted runs resume;
-    the history is appended after every fold.
+    the history is appended after every fold. With several ``devices`` (e.g. ``["cuda:0", "cuda:1"]`` on two T4),
+    missing folds are trained in parallel, one process per device; prediction then runs on the first device.
     """
     output_dir = Path(output_dir)
+    devices = list(devices or [config.device])
     (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2))
     folds = assign_folds(records, n_folds, config.seed)
@@ -366,27 +413,42 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
     history_path = output_dir / "history.csv"
     with_risk = config.out_channels > 1
 
+    def job(fold: int, device: str) -> tuple:
+        training = [r.case_id for r in records if folds[r.case_id] != fold]
+        return cache, training, config, hlut, fold, output_dir / f"fold{fold}.pt", device
+
+    pending = []
     for fold in range(n_folds):
         checkpoint = output_dir / f"fold{fold}.pt"
-        held_out = [r.case_id for r in records if folds[r.case_id] == fold]
         if checkpoint.exists():
-            model = _load_checkpoint(checkpoint, config)
+            _load_checkpoint(checkpoint, config)  # refuses a checkpoint trained with another configuration
         else:
-            training = [cache.load(r.case_id) for r in records if folds[r.case_id] != fold]
-            model, history = train_model(training, replace(config, seed=config.seed + fold), hlut)
-            torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold}, checkpoint)
-            previous = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
-            pd.concat([previous, history.assign(fold=fold)], ignore_index=True).to_csv(history_path, index=False)
-        for case_id in held_out:
+            pending.append(fold)
+    if len(devices) > 1 and len(pending) > 1:
+        context = multiprocessing.get_context("spawn")  # CUDA cannot be shared with forked processes
+        for start in range(0, len(pending), len(devices)):
+            wave = pending[start:start + len(devices)]
+            with ProcessPoolExecutor(max_workers=len(wave), mp_context=context) as pool:
+                futures = [pool.submit(train_fold, *job(fold, device)) for fold, device in zip(wave, devices)]
+                for future in futures:
+                    _append_history(history_path, future.result())
+    else:
+        for fold in pending:
+            _append_history(history_path, train_fold(*job(fold, devices[0])))
+
+    device = devices[0]
+    for fold in range(n_folds):
+        model = _load_checkpoint(output_dir / f"fold{fold}.pt", replace(config, device=device))
+        for case_id in (r.case_id for r in records if folds[r.case_id] == fold):
             case = cache.load(case_id)
-            geometry = dict(spacing=case.spacing, origin=case.origin, direction=case.direction)
             if with_risk:
-                sct, risk = predict_case(model, case, config.context, config.device, with_risk=True)
+                sct, risk = predict_case(model, case, config.context, device, with_risk=True)
+                geometry = dict(spacing=case.spacing, origin=case.origin, direction=case.direction)
                 for name, density in zip(("var", "excess"), uncrop(case, risk, fill=0.0)):
                     write_volume(density, output_dir / "risk" / f"{case_id}_{name}.mha", **geometry)
             else:
-                sct = predict_case(model, case, config.context, config.device)
-            write_volume(uncrop(case, sct), output_dir / "predictions" / f"{case_id}.mha", **geometry)
+                sct = predict_case(model, case, config.context, device)
+            _write_prediction(sct, case, output_dir / "predictions" / f"{case_id}.mha")
     return frame
 
 
@@ -411,6 +473,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--risk-weight", type=float, help="override β of R6")
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", default=TrainConfig.device)
+    parser.add_argument("--devices", help="comma-separated devices to train folds in parallel, e.g. cuda:0,cuda:1 "
+                                          "(default: every visible GPU)")
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args(argv)
 
@@ -443,9 +507,10 @@ def main(argv: list[str] | None = None) -> None:
         config, name = arm_config(args.arm, **overrides), args.arm
     else:
         config, name = TrainConfig(loss=args.loss, **overrides), args.loss
+    devices = args.devices.split(",") if args.devices else visible_devices(args.device)
     cache = VolumeCache(args.cache_dir)
-    print(f"caching {cache.build(records)} new cases")
-    crossfit(records, cache, config, hlut, args.folds, args.out / name)
+    print(f"caching {cache.build(records)} new cases · training on {', '.join(devices)}")
+    crossfit(records, cache, config, hlut, args.folds, args.out / name, devices)
     print(f"out-of-fold predictions in {args.out / name / 'predictions'}")
 
 
