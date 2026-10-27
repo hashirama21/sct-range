@@ -1,4 +1,4 @@
-"""Figures for the S1 notebook (validated three-slot categorical palette, one y-scale per axis)."""
+"""Figures for the notebooks (validated three-slot categorical palette, one y-scale per axis)."""
 
 from __future__ import annotations
 
@@ -340,5 +340,186 @@ def plot_signed_bias(frame: pd.DataFrame, column: str = "target_mean_signed_mm")
     ax.set_ylabel("mean signed ΔWET to distal edge (mm)")
     ax.set_title("Signed range bias by region (bars: mean, dots: cases)")
     ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# ----------------------------------------------------------------------------------------- S6 dosimetry figures
+
+DOSE_MAP = LinearSegmentedColormap.from_list("dose", ["#f0efec", "#9ec5f0", "#2a78d6", "#0d3a73"])
+
+
+def plot_dose_slices(slices: dict[str, np.ndarray], sources: Sequence[str], modality: str = "proton",
+                     prescription: float = 60.0) -> plt.Figure:
+    """Reference dose on the reference CT, then the dose difference of each source (central target slice)."""
+    reference = slices[f"{modality}/reference"]
+    sources = [s for s in sources if f"{modality}/{s}" in slices]
+    fig, axes = plt.subplots(1, 1 + len(sources), figsize=(3.0 * (1 + len(sources)), 3.2))
+    axes = np.atleast_1d(axes)
+    axes[0].imshow(slices["ct"], cmap="gray", vmin=-1000, vmax=1200)
+    shown = np.ma.masked_less(reference, 0.1 * prescription)
+    image = axes[0].imshow(shown, cmap=DOSE_MAP, vmin=0, vmax=1.05 * prescription, alpha=0.85)
+    axes[0].contour(slices["target"], levels=[0.5], colors=[INK], linewidths=0.8)
+    axes[0].set_title(f"{modality} dose (Gy)")
+    fig.colorbar(image, ax=axes[0], fraction=0.046, pad=0.02)
+    limit = 0.1 * prescription
+    for ax, source in zip(axes[1:], sources):
+        difference = slices[f"{modality}/{source}"] - reference
+        diff_image = ax.imshow(difference, cmap=DIVERGING, vmin=-limit, vmax=limit)
+        ax.contour(slices["target"], levels=[0.5], colors=[INK], linewidths=0.8)
+        ax.set_title(f"{source} − reference")
+    if sources:
+        fig.colorbar(diff_image, ax=axes[-1], fraction=0.046, pad=0.02, label="Gy")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def plot_gamma_by_source(frame: pd.DataFrame, order: Sequence[str], criteria: str = "2_2") -> plt.Figure:
+    """Gamma pass rate per source: one panel per modality, cases as dots, the median as a bar end."""
+    modalities = [m for m in ("proton", "photon") if f"{m}_gamma_{criteria}" in frame]
+    fig, axes = plt.subplots(1, len(modalities), figsize=(5.2 * len(modalities), 3.6), squeeze=False)
+    rng = np.random.default_rng(0)
+    for ax, modality, color in zip(axes[0], modalities, SERIES):
+        column = f"{modality}_gamma_{criteria}"
+        for position, source in enumerate(order):
+            values = frame.loc[frame["source"] == source, column].dropna()
+            if values.empty:
+                continue
+            ax.plot(position + rng.uniform(-0.15, 0.15, len(values)), values, "o", color=color, alpha=0.55,
+                    markersize=4, markeredgewidth=0)
+            ax.plot([position - 0.3, position + 0.3], [values.median()] * 2, color=INK, linewidth=2)
+        ax.set_xticks(range(len(order)), order, rotation=30, ha="right")
+        ax.set_ylabel(f"γ {criteria.replace('_', ' %/')} mm pass rate (%)")
+        ax.set_title(f"{modality.capitalize()} plans recomputed on each sCT")
+    fig.tight_layout()
+    return fig
+
+
+def plot_proxy_validation(cases: pd.DataFrame, rays: pd.DataFrame, x: str = "proxy_rms_mm",
+                          y: str = "proton_gamma_fail_2_2") -> plt.Figure:
+    """Range proxy against proton dose: case level (left) and ray level (right, density of rays)."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    data = cases[[x, y]].dropna()
+    axes[0].plot(data[x], data[y], "o", color=SERIES[0], alpha=0.7, markeredgecolor=SURFACE)
+    axes[0].set_xlabel("RMS ΔWET to distal edge, plan beams (mm)")
+    axes[0].set_ylabel("proton γ 2 %/2 mm failure rate (%)")
+    axes[0].set_title("Case level: one dot per case and source")
+    if not rays.empty:
+        limit = float(np.nanpercentile(np.abs(np.r_[rays["delta_wet_mm"], rays["delta_r80_mm"]]), 99))
+        limit = max(limit, 1.0)
+        image = axes[1].hexbin(rays["delta_wet_mm"], rays["delta_r80_mm"], gridsize=40, mincnt=1, bins="log",
+                               cmap=DOSE_MAP, extent=(-limit, limit, -limit, limit))
+        line = np.array([-limit, limit])
+        axes[1].plot(line, -line, color=INK_SECONDARY, linewidth=1, linestyle="--")
+        axes[1].annotate("ΔR80 = −ΔWET", (0.55 * limit, -0.55 * limit), xytext=(6, 4), textcoords="offset points",
+                         color=INK_SECONDARY)
+        fig.colorbar(image, ax=axes[1], fraction=0.046, pad=0.02, label="rays (log)")
+    axes[1].set_xlabel("ΔWET to distal target edge (mm of water)")
+    axes[1].set_ylabel("distal R80 shift (mm)")
+    axes[1].set_title("Ray level: proton beams of every case")
+    fig.tight_layout()
+    return fig
+
+
+# ----------------------------------------------------------------------------------------- S7 generative figures
+
+
+def plot_eta_sweep(sweep: pd.DataFrame, selected: float | None = None) -> plt.Figure:
+    """Median projected CRPS, WET-interval coverage and ensemble spread against eta (one panel each)."""
+    panels = (("pcrps_mm", "projected CRPS (mm)"), ("coverage90", "90 % interval coverage"),
+              ("spread_mm", "ensemble spread of ΔWET (mm)"))
+    medians = sweep.groupby("eta")[[p for p, _ in panels]].median()
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+    for ax, (column, label) in zip(axes, panels):
+        ax.plot(medians.index, medians[column], "o-", color=SERIES[0], markeredgecolor=SURFACE)
+        if column == "coverage90":
+            ax.axhline(0.9, color=INK_SECONDARY, linestyle=":", linewidth=1)
+            ax.annotate("nominal", (medians.index.max(), 0.9), xytext=(-48, 4), textcoords="offset points",
+                        color=INK_SECONDARY)
+        if selected is not None and selected in medians.index:
+            ax.plot(selected, medians.loc[selected, column], "o", color=SERIES[1], markersize=10,
+                    markeredgecolor=SURFACE, markeredgewidth=2, zorder=3)
+        ax.set_xlabel("η (interpolant noise)")
+        ax.set_ylabel(label)
+    axes[0].set_title("η sweep (orange: selected)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_steps_curve(curve: pd.DataFrame) -> plt.Figure:
+    """Quality against the number of sampling steps: image error, range error of the mean, projected CRPS."""
+    panels = (("mae_hu", "MAE of the SPR mean (HU)"), ("target_rms_mm", "RMS ΔWET of the mean (mm)"),
+              ("pcrps_mm", "projected CRPS (mm)"))
+    medians = curve.groupby("n_steps")[[p for p, _ in panels]].median()
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+    for ax, (column, label) in zip(axes, panels):
+        ax.plot(medians.index, medians[column], "o-", color=SERIES[0], markeredgecolor=SURFACE)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(medians.index, [str(int(n)) for n in medians.index])
+        ax.set_xlabel("sampling steps")
+        ax.set_ylabel(label)
+    axes[0].set_title("Quality vs number of steps")
+    fig.tight_layout()
+    return fig
+
+
+def plot_pit(counts: pd.DataFrame) -> plt.Figure:
+    """Pooled PIT histogram of the true WET among the samples (flat when calibrated)."""
+    pooled = counts.sum(axis=0).to_numpy(dtype=float)
+    share = pooled / pooled.sum()
+    fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    ax.bar(np.arange(len(share)), share, 0.9, color=SERIES[0])
+    ax.axhline(1.0 / len(share), color=INK_SECONDARY, linestyle=":", linewidth=1)
+    ax.annotate("uniform", (len(share) - 1, 1.0 / len(share)), xytext=(-40, 5), textcoords="offset points",
+                color=INK_SECONDARY)
+    ax.set_xlabel("rank of the truth among the samples")
+    ax.set_ylabel("share of rays")
+    ax.set_title("Probability integral transform of ray WET")
+    fig.tight_layout()
+    return fig
+
+
+def plot_paired_differences(frame: pd.DataFrame, comparisons: Sequence[tuple[str, str, str, str]]) -> plt.Figure:
+    """Per-case differences ``first - second`` of a column, one panel per comparison; below zero favours ``first``.
+
+    ``comparisons``: ``(column, first, second, label)``.
+    """
+    fig, axes = plt.subplots(1, len(comparisons), figsize=(3.6 * len(comparisons), 3.4), squeeze=False)
+    rng = np.random.default_rng(0)
+    for ax, (column, first, second, label) in zip(axes[0], comparisons):
+        wide = frame.pivot_table(index="case_id", columns="source", values=column)
+        if first not in wide or second not in wide:
+            ax.set_title(f"{label}: no data")
+            continue
+        difference = (wide[first] - wide[second]).dropna()
+        ax.plot(rng.uniform(-0.2, 0.2, len(difference)), difference, "o", color=SERIES[0], alpha=0.6,
+                markersize=4, markeredgewidth=0)
+        ax.plot([-0.35, 0.35], [difference.median()] * 2, color=INK, linewidth=2)
+        ax.axhline(0.0, color=INK_SECONDARY, linewidth=0.8)
+        ax.set_xticks([])
+        ax.set_ylabel(f"{first} − {second}")
+        ax.set_title(label)
+    fig.tight_layout()
+    return fig
+
+
+def plot_sample_gallery(ct: np.ndarray, samples: np.ndarray, point: np.ndarray, mask: np.ndarray,
+                        slice_index: int) -> plt.Figure:
+    """Reference, SPR mean, two samples and the voxel-wise standard deviation of the samples on one slice."""
+    inside = mask[slice_index] > 0.5
+    panels = [("reference CT", ct[slice_index]), ("SPR mean of samples", point[slice_index]),
+              ("sample 1", samples[0, slice_index]), ("sample 2", samples[min(1, len(samples) - 1), slice_index])]
+    fig, axes = plt.subplots(1, 5, figsize=(15, 3.2))
+    for ax, (title, image) in zip(axes, panels):
+        ax.imshow(image, cmap="gray", vmin=-1000, vmax=1200)
+        ax.set_title(title)
+    spread = np.where(inside, samples[:, slice_index].std(axis=0), np.nan)
+    image = axes[4].imshow(spread, cmap=DOSE_MAP, vmin=0, vmax=np.nanpercentile(spread, 99) or 1)
+    axes[4].set_title("sample std (HU)")
+    fig.colorbar(image, ax=axes[4], fraction=0.046, pad=0.02)
+    for ax in axes:
+        ax.axis("off")
     fig.tight_layout()
     return fig

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sctrange"
-version = "0.4.0"
+version = "0.5.0"
 description = "Range-aware evaluation and training utilities for synthetic CT (SynthRAD2025)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "SimpleITK>=2.3",
     "pandas>=2.0",
     "matplotlib>=3.7",
+    "huggingface_hub>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,8 @@ dev = ["pytest>=8", "nbformat>=5.9", "nbclient>=0.9", "nbconvert>=7", "ipykernel
 sctrange-split = "sctrange.split:main"
 sctrange-train = "sctrange.training:main"
 sctrange-download = "sctrange.download:main"
+sctrange-dose = "sctrange.dosimetry:main"
+sctrange-generative = "sctrange.generative:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

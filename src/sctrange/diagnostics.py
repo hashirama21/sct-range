@@ -170,7 +170,9 @@ def decide_arms(frame: pd.DataFrame, prereg: Preregistration) -> dict[str, objec
     """Pre-registered S4-S5 rule (``configs/s4_preregistration.json``) on per-case metrics, one row per case and arm.
 
     Each method arm is compared with the reference (R3) and with the bias-correction control (R4) by one-sided paired
-    Wilcoxon tests on the primary metric, Holm-adjusted over the whole family; its MAE must stay within the tolerance.
+    Wilcoxon tests on the primary metric, Holm-adjusted over the whole family. The MAE condition is one-sided: the median
+    relative MAE change against the reference must not exceed the tolerance, so an arm that also improves MAE qualifies
+    (version 1 of the rule used ``|change| <= tolerance``, which rejected such an arm; amended before any real result).
     """
     rule = prereg.raw
     metric, reference, control = rule["primary_metric"], rule["reference_arm"], rule["control_arm"]
@@ -189,7 +191,7 @@ def decide_arms(frame: pd.DataFrame, prereg: Preregistration) -> dict[str, objec
             "p_vs_reference_holm": adjusted[f"{arm} < {reference}"],
             "p_vs_control_holm": adjusted[f"{arm} < {control}"],
             "median_relative_mae_change": relative,
-            "mae_within_tolerance": bool(abs(relative) <= tolerance) if np.isfinite(relative) else False,
+            "mae_within_tolerance": bool(relative <= tolerance) if np.isfinite(relative) else False,
         }
     beats_reference = [a for a, d in details.items() if d["p_vs_reference_holm"] < alpha and d["mae_within_tolerance"]]
     beats_control = [a for a in beats_reference if details[a]["p_vs_control_holm"] < alpha]

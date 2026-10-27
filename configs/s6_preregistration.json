@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "registered": "2026-10-26",
+  "question": "Go/no-go 2: does a range-aware arm (R5, R6) that lowers the range-error tail at comparable MAE (S4) also improve the proton gamma pass rate over R3, and is the gain more than the per-tissue bias correction R4? Secondary: does the per-ray WET error track proton dose?",
+  "cases": {
+    "n_cases": 20,
+    "task": "1",
+    "stratify": "region (largest-remainder allocation), hashed order within region",
+    "seed": 20261116,
+    "pool": "development cases with an out-of-fold R3 prediction for seed 0; test cases are never loaded"
+  },
+  "arms": ["R1", "R2", "R3", "R4", "R5", "R6"],
+  "seeds": [0, 1, 2],
+  "aggregation": "per-case metrics averaged over seeds before testing",
+  "plans": {
+    "target": "sphere at the body centroid (SynthRAD2025 releases no PTV), same as the range harness",
+    "target_radius_mm": 25.0,
+    "outside_body": "set to air in the reference CT and in every sCT",
+    "proton_angles_deg": [0.0, 120.0, 240.0],
+    "photon_angles_deg": [0.0, 51.4286, 102.8571, 154.2857, 205.7143, 257.1429, 308.5714],
+    "angle_convention": "sctrange projector (0 travels +y, 90 travels +x); pyRadPlan gantry = (360 - angle) mod 360",
+    "bixel_width_mm": 5.0,
+    "dose_grid_mm": 3.0,
+    "prescription_gy": 60.0,
+    "objectives": "target squared deviation to the prescription (priority 800), body squared overdosing above 50 % (priority 10)",
+    "optimised_on": "reference CT; the same weights are recomputed on every sCT and on the reference CT (forward engine)",
+    "engine": "pyRadPlan default proton (Generic) and photon (Generic) machines and HLUT"
+  },
+  "gamma": {
+    "criteria": [[2.0, 2.0], [1.0, 1.0]],
+    "cutoff_percent": 10.0,
+    "normalisation": "global, maximum of the reference recomputation"
+  },
+  "primary_metric": "proton_gamma_2_2",
+  "reference_arm": "R3",
+  "control_arm": "R4",
+  "method_arms": ["R5", "R6"],
+  "alpha": 0.05,
+  "test": "one-sided paired Wilcoxon (method arm > comparator) over the dosimetry cases; Holm over the four comparisons",
+  "s4_report": "s4/s4_report.json",
+  "verdicts": {
+    "GO": "some method arm beats R3 and R4 on target CVaR90 in S4 (MAE condition met) and beats R3 on proton gamma 2%/2mm here",
+    "RANGE GAIN WITHOUT DOSE CONFIRMATION": "some method arm beats R3 and R4 on target CVaR90 in S4, but none beats R3 on proton gamma",
+    "RIGHT ESTIMATOR SUFFICES": "some method arm beats R3 on target CVaR90 in S4, none beats R4",
+    "NO-GO": "no method arm beats R3 on target CVaR90 in S4",
+    "NOT EVALUATED": "no S4 verdict on real data"
+  },
+  "proxy": {
+    "case_metric": "proxy_rms_mm",
+    "dose_metric": "proton_gamma_fail_2_2",
+    "partial_given": "mae_hu",
+    "min_spearman": 0.5,
+    "ray_min_spearman": 0.7,
+    "unit": "case-level pairs are (case, arm) after seed averaging, bulk density included; bootstrap resamples cases",
+    "verdicts": {
+      "VALIDATED": "case Spearman >= 0.5 with 95 % CI above 0, partial Spearman given MAE with CI above 0, and ray Spearman(dWET, -dR80) >= 0.7",
+      "PARTIAL": "only the case-level or only the ray-level criterion holds",
+      "NOT VALIDATED": "neither holds"
+    }
+  },
+  "secondary": [
+    "photon gamma pass rates of every arm (expected near 100 %: photons are insensitive to SPR errors)",
+    "proton gamma of R1 versus R3 (Proposition 5 in dose), two-sided",
+    "target D95, D2 and mean dose differences by arm and region",
+    "Theil-Sen slope of dR80 on dWET (expected about -1 / SPR at the distal edge)"
+  ]
+}

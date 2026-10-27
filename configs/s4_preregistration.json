@@ -1,11 +1,16 @@
 {
-  "version": 1,
+  "version": 2,
   "registered": "2026-10-22",
+  "amended": "2026-10-26",
+  "amendment": "The MAE condition is one-sided: median relative MAE change against R3 <= +5 %. Version 1 applied |change| <= 5 %, which rejected an arm that improves both MAE and the range tail. Amended before any real prediction existed (the frozen split had not been created).",
   "question": "At a strictly matched budget, does a range-aware objective (R5, R6) lower the tail of the range error to the distal target edge relative to the SPR-space Bayes act (R3), and does it do more than a per-tissue SPR bias correction of R3 (R4)?",
   "primary_metric": "target_cvar_mm",
   "reference_arm": "R3",
   "control_arm": "R4",
-  "method_arms": ["R5", "R6"],
+  "method_arms": [
+    "R5",
+    "R6"
+  ],
   "mae_relative_tolerance": 0.05,
   "alpha": 0.05,
   "aggregation": "per-case metrics averaged over seeds before testing; one-sided paired Wilcoxon over development cases; Holm over the four comparisons",
@@ -14,5 +19,6 @@
     "BIAS CORRECTION SUFFICES": "some method arm beats R3 with MAE within tolerance, none beats R4",
     "NO GAIN": "otherwise"
   },
-  "note": "Range proxy only. The gamma-proton part of go/no-go 2 requires the S6 dosimetry subset."
+  "note": "Range proxy only. The gamma-proton part of go/no-go 2 requires the S6 dosimetry subset.",
+  "mae_rule": "median over cases of MAE_arm / MAE_R3 - 1 must be <= mae_relative_tolerance"
 }

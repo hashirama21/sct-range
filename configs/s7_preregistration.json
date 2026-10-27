@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "registered": "2026-10-26",
+  "question": "Does a conditional generative model (flow matching with a stochastic interpolant, same backbone and budget as R1-R6) give calibrated range-error distributions, does its SPR mean do better than the regression Bayes act R3, and does it estimate range-error tails better than the R6 head?",
+  "task": "1",
+  "seed": 0,
+  "folds": 5,
+  "steps": 30000,
+  "model": {
+    "interpolant": "x_t = (1 - t) x_0 + t x_1 + gamma(t) z, gamma(t) = 2 eta t (1 - t), in encoded CT units",
+    "x0": "bulk-density image of the body (0 HU inside, -1000 HU outside)",
+    "outputs": "drift E[x_1 - x_0 + gamma'(t) z | x_t] and, for eta > 0, denoiser E[z | x_t]",
+    "sampler": "Euler-Maruyama, eps(t) = kappa gamma(t), kappa = 0.1 (injected noise of the order of the interpolant noise), from X_0 = x_0",
+    "backbone": "TimeUNet2d: the U-Net of the regression arms (same widths and depth) with FiLM time conditioning",
+    "point_prediction": "SPR mean of the samples, g^-1(mean_k g(sample_k)) (Proposition 4)"
+  },
+  "eta_grid": [
+    0.0,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "subsets": {
+    "seed": 20261123,
+    "rule": "region-stratified, hashed order within region (sctrange.dosimetry.select_cases); development cases with a seed-0 R3 prediction"
+  },
+  "sweep": {
+    "cases": 30,
+    "n_samples": 8,
+    "n_steps": 16,
+    "selection_metric": "pcrps_mm",
+    "selection_rule": "among eta > 0, the lowest median over the sweep cases; ties go to the smaller eta. eta = 0 is deterministic and serves as the collapse control, never as a candidate"
+  },
+  "steps_curve": {
+    "cases": 10,
+    "n_samples": 8,
+    "n_steps": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "main": {
+    "cases": 100,
+    "n_samples": 16,
+    "n_steps": 16
+  },
+  "comparators": "R3 and R6 of the S4 runs, seed 0 (same single-seed budget as the generator), on the main cases",
+  "generative_name": "G",
+  "alpha": 0.05,
+  "tests": {
+    "mean_better_than_R3": {
+      "column": "target_rms_mm",
+      "first": "G",
+      "second": "R3",
+      "alternative": "less"
+    },
+    "proper_score_better_than_R3": {
+      "column": "pcrps_mm",
+      "first": "G",
+      "second": "R3",
+      "alternative": "less"
+    },
+    "tail_score_vs_R6": {
+      "column": "risk_fz",
+      "first": "G",
+      "second": "R6",
+      "alternative": "two-sided"
+    },
+    "tail_calibration_vs_R6": {
+      "column": "risk_miscalibration",
+      "first": "G",
+      "second": "R6",
+      "alternative": "two-sided"
+    }
+  },
+  "multiplicity": "Holm over the four tests",
+  "expectations": {
+    "mean_better_than_R3": false,
+    "proper_score_better_than_R3": true
+  },
+  "collapse": {
+    "max_spread_ratio": 0.05,
+    "statement": "eta = 0 is deterministic: its median ensemble spread must be at most 5 % of the smallest median spread among eta > 0"
+  },
+  "calibration": {
+    "coverage": "share of rays whose true WET lies in the central 90 % interval of the ensemble (nominal 0.9)",
+    "pit": "rank of the truth among the samples, pooled over rays; uniform when calibrated",
+    "uncertainty_error": "per-case Spearman between ensemble spread and absolute WET error of the point prediction; median reported"
+  },
+  "notes": [
+    "Projected CRPS is proper but not strictly proper on finite segment families (docs/theory.md, Proposition 8).",
+    "risk_fz compares each model's tail forecast with its own error; the outcomes differ between G and R6, so risk_miscalibration (|coverage - 0.9|) is reported alongside.",
+    "The theory predicts that the generator's mean equals R3 at best; a significant gain would point to a better-fitted model rather than to the generative formulation."
+  ]
+}

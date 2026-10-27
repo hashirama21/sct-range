@@ -1,222 +1,85 @@
-"""Download, verify, extract and validate the SynthRAD2025 training data from Zenodo.
+"""Fetch and validate the SynthRAD2025 training data from its Hugging Face mirror.
 
-Record 15373853 (v2, 11 May 2025, CT and CBCT clipped to [-1024, 3071] HU) holds
-``synthRAD2025_Task1_Train.zip`` (MR -> CT, 14.8 GB) and ``synthRAD2025_Task2_Train.zip`` (CBCT -> CT, 12.0 GB).
-Licence CC BY-NC 4.0; cite Thummerer et al. (2025), doi:10.5281/zenodo.15373853.
+The training set (Zenodo record 15373853, v2, CT and CBCT clipped to [-1024, 3071] HU; licence CC BY-NC 4.0; cite
+Thummerer et al. (2025), doi:10.5281/zenodo.15373853) is mirrored, already extracted, as a public Hugging Face
+dataset (default ``developper669/synthrad2025``, tag ``v2``)::
 
-Pipeline (each step is idempotent, so an interrupted run resumes where it stopped):
+    Task<k>/<region>/<case_id>/{ct,mask,mr|cbct}.mha
+    Task<k>/<region>/overview/...
+    manifest.csv                  integrity check of every case (``check_case``)
 
-1. query the Zenodo REST API for the file list, sizes and MD5 checksums;
-2. stream every archive to ``<root>/archives`` with HTTP range resumption and verify its MD5;
-3. extract into ``<root>/Task<k>/<region>/<case_id>/`` whatever the folder nesting inside the zip,
-   refusing members that would escape the target directory;
-4. check every case (files present, identical geometry, isotropic in-plane spacing, CT range) and write
-   ``<root>/manifest.csv``.
+Every notebook and command reads the data from there only. ``fetch`` downloads the requested tasks (optionally some
+regions) into ``<root>`` with ``huggingface_hub.snapshot_download``: parallel, resumable, files already present are
+skipped, and the revision is pinned so that every run sees the same files. The resulting ``<root>`` is what
+``SYNTHRAD2025_ROOT`` and ``sctrange.data.discover_cases`` expect.
 
-The resulting ``<root>`` is what ``SYNTHRAD2025_ROOT`` and ``sctrange.data.discover_cases`` expect.
+``SCT_HF_DATASET`` and ``SCT_HF_REVISION`` override the repository and the revision.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import shutil
+import os
 import sys
-import time
-import urllib.error
-import urllib.request
-import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .data import CASE_ID_PATTERN, CaseRecord, discover_cases
+from .data import CaseRecord, discover_cases
 
-ZENODO_API = "https://zenodo.org/api/records/{record}"
-TRAINING_RECORD = "15373853"
-CHUNK_BYTES = 8 << 20
+HF_DATASET = "developper669/synthrad2025"
+HF_REVISION = "v2"
 CT_CLIP_HU = (-1024.0, 3071.0)
-_TASK_DIR = {"1": "Task1", "2": "Task2"}
+TASK_DIRS = {"1": "Task1", "2": "Task2"}
 
 
-@dataclass(frozen=True)
-class RemoteFile:
-    key: str
-    url: str
-    size: int
-    md5: str | None
-
-    @property
-    def task(self) -> str | None:
-        """Task number read from the archive name (``..._Task1_...``), if any."""
-        for task, name in _TASK_DIR.items():
-            if name.lower() in self.key.lower():
-                return task
-        return None
+def dataset_repo() -> str:
+    return os.environ.get("SCT_HF_DATASET", HF_DATASET)
 
 
-def _open(url: str, headers: dict[str, str] | None = None, timeout: float = 60.0):
-    request = urllib.request.Request(url, headers={"User-Agent": "sctrange", **(headers or {})})
-    return urllib.request.urlopen(request, timeout=timeout)
+def dataset_revision() -> str:
+    return os.environ.get("SCT_HF_REVISION", HF_REVISION)
 
 
-def list_record_files(record: str = TRAINING_RECORD, api: str = ZENODO_API, retries: int = 6) -> list[RemoteFile]:
-    """Files of a public Zenodo record, from its REST API entry (retried on network errors, e.g. flaky DNS)."""
-    for attempt in range(retries + 1):
-        try:
-            with _open(api.format(record=record)) as response:
-                payload = json.load(response)
-            break
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
-            if isinstance(error, urllib.error.HTTPError) and error.code < 500 or attempt == retries:
-                raise
-            wait = min(2**attempt, 30)
-            print(f"Zenodo API: {error!s}; retrying in {wait} s", file=sys.stderr)
-            time.sleep(wait)
-    files = []
-    for entry in payload.get("files", []):
-        checksum = entry.get("checksum", "")
-        algorithm, _, digest = checksum.partition(":")
-        files.append(RemoteFile(
-            key=entry["key"],
-            url=entry["links"].get("content") or entry["links"]["self"],
-            size=int(entry["size"]),
-            md5=digest if algorithm == "md5" and digest else None,
-        ))
-    if not files:
-        raise RuntimeError(f"Zenodo record {record} lists no files")
-    return files
+def _fetched_marker(root: Path, task: str, repo_id: str, revision: str) -> Path:
+    return root / TASK_DIRS[task] / f".fetched-{repo_id.replace('/', '--')}-{revision}"
 
 
-def md5sum(path: str | Path, chunk: int = CHUNK_BYTES) -> str:
-    digest = hashlib.md5()
-    with open(path, "rb") as handle:
-        while block := handle.read(chunk):
-            digest.update(block)
-    return digest.hexdigest()
+def fetch(root: str | Path, tasks: Iterable[str] = ("1", "2"), regions: Iterable[str] | None = None,
+          repo_id: str | None = None, revision: str | None = None, max_workers: int = 16) -> Path:
+    """Download the cases of ``tasks`` (all regions, or only ``regions``) and the manifest into ``root``.
 
-
-def _progress(key: str) -> Callable[[int, int], None]:
-    state = {"last": 0.0}
-
-    def report(done: int, total: int) -> None:
-        now = time.monotonic()
-        if now - state["last"] >= 2.0 or done >= total:
-            state["last"] = now
-            share = done / total if total else 1.0
-            print(f"\r{key}: {done / 2**30:6.2f} / {total / 2**30:.2f} GiB ({share:6.1%})", end="", file=sys.stderr)
-            if done >= total:
-                print(file=sys.stderr)
-    return report
-
-
-def download_file(remote: RemoteFile, destination: str | Path, retries: int = 8,
-                  progress: Callable[[int, int], None] | None = None) -> Path:
-    """Stream ``remote`` to ``destination``, resuming a ``.part`` file; verify size and MD5.
-
-    An existing complete file with the right checksum is kept as is.
+    Interrupted downloads resume; files already in ``root`` are not downloaded again. A complete task (no region
+    filter) leaves a marker, so that later calls need no network.
     """
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.stat().st_size == remote.size:
-        if remote.md5 is None or md5sum(destination) == remote.md5:
-            return destination
-        destination.unlink()
-    partial = destination.with_name(destination.name + ".part")
-    progress = progress or _progress(remote.key)
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError
 
-    for attempt in range(retries + 1):
-        offset = partial.stat().st_size if partial.exists() else 0
-        if offset > remote.size:
-            partial.unlink()
-            offset = 0
-        if offset == remote.size:
-            break
-        try:
-            headers = {"Range": f"bytes={offset}-"} if offset else {}
-            with _open(remote.url, headers, timeout=120.0) as response:
-                if offset and response.status != 206:
-                    offset = 0  # server ignored the range: restart from scratch
-                with open(partial, "ab" if offset else "wb") as handle:
-                    done = offset
-                    while block := response.read(CHUNK_BYTES):
-                        handle.write(block)
-                        done += len(block)
-                        progress(done, remote.size)
-            if partial.stat().st_size == remote.size:
-                break
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-            if attempt == retries:
-                raise RuntimeError(f"download of {remote.key} failed after {retries + 1} attempts") from error
-            wait = min(2**attempt, 60)
-            print(f"\n{remote.key}: {error!s}; retrying in {wait} s", file=sys.stderr)
-            time.sleep(wait)
-    else:
-        raise RuntimeError(f"download of {remote.key} stopped at {partial.stat().st_size} of {remote.size} bytes")
-
-    if remote.md5 is not None and (actual := md5sum(partial)) != remote.md5:
-        partial.unlink()
-        raise RuntimeError(f"{remote.key}: MD5 {actual} does not match Zenodo's {remote.md5}; partial file removed")
-    partial.replace(destination)
-    return destination
-
-
-def member_destination(member: str, default_task: str | None = None) -> PurePosixPath | None:
-    """Canonical relative path of a zip member, or ``None`` to skip it.
-
-    Case files go to ``Task<k>/<region>/<case_id>/<file>`` wherever the case folder sits in the archive; the
-    per-region ``overview`` folders keep their path from the ``Task<k>`` component on. Other members are
-    placed under ``Task<k>/`` when the task is known, else skipped.
-    """
-    parts = PurePosixPath(member.replace("\\", "/")).parts
-    if not parts or member.endswith("/") or any(p in ("..", "") for p in parts) or parts[0].startswith("/"):
-        return None
-    if parts[0].startswith("__MACOSX") or parts[-1].startswith("._"):
-        return None
-    for index, part in enumerate(parts[:-1]):
-        match = CASE_ID_PATTERN.match(part)
-        if match:
-            fields = match.groupdict()
-            return PurePosixPath(_TASK_DIR[fields["task"]], fields["region"], part, *parts[index + 1:])
-    for index, part in enumerate(parts):
-        if part in _TASK_DIR.values():
-            return PurePosixPath(*parts[index:])
-    if default_task is not None:
-        return PurePosixPath(_TASK_DIR[default_task], *parts[1:] if len(parts) > 1 else parts)
-    return None
-
-
-def extract_archive(archive: str | Path, root: str | Path, default_task: str | None = None,
-                    overwrite: bool = False) -> int:
-    """Extract ``archive`` into the canonical layout under ``root``; return the number of files written.
-
-    Files already present with the expected size are skipped, so extraction resumes after an interruption.
-    """
-    root = Path(root).resolve()
-    written = 0
-    with zipfile.ZipFile(archive) as bundle:
-        for info in bundle.infolist():
-            if info.is_dir():
-                continue
-            relative = member_destination(info.filename, default_task)
-            if relative is None:
-                continue
-            target = (root / relative).resolve()
-            if root not in target.parents:
-                raise ValueError(f"refusing to extract {info.filename!r} outside {root}")
-            if target.exists() and target.stat().st_size == info.file_size and not overwrite:
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".tmp")
-            with bundle.open(info) as source, open(temporary, "wb") as sink:
-                shutil.copyfileobj(source, sink, CHUNK_BYTES)
-            temporary.replace(target)
-            written += 1
-    return written
+    root = Path(root)
+    tasks = tuple(sorted(set(tasks)))
+    regions = tuple(sorted(set(regions))) if regions else None
+    repo_id, revision = repo_id or dataset_repo(), revision or dataset_revision()
+    folders = [f"{TASK_DIRS[t]}/{r}" for t in tasks for r in regions] if regions else [TASK_DIRS[t] for t in tasks]
+    patterns = ["manifest.csv", *(f"{folder}/**" for folder in folders)]
+    print(f"fetching task(s) {', '.join(tasks)}{' (' + ', '.join(regions) + ')' if regions else ''} "
+          f"from huggingface.co/datasets/{repo_id}@{revision} into {root}", file=sys.stderr)
+    try:
+        snapshot_download(repo_id, repo_type="dataset", revision=revision, local_dir=root,
+                          allow_patterns=patterns, max_workers=max_workers)
+    except (RepositoryNotFoundError, RevisionNotFoundError) as error:
+        raise FileNotFoundError(f"Hugging Face dataset {repo_id}@{revision} not found: has the Zenodo mirror been "
+                                "published (notebooks/s0_zenodo_to_huggingface.ipynb)? SCT_HF_DATASET and "
+                                "SCT_HF_REVISION select another repository or revision") from error
+    present = {record.task for record in discover_cases(root)}
+    if missing := [t for t in tasks if t not in present]:
+        raise FileNotFoundError(f"{repo_id}@{revision} holds no case of task(s) {', '.join(missing)}")
+    if regions is None:
+        for task in tasks:
+            _fetched_marker(root, task, repo_id, revision).write_text(f"{repo_id}@{revision}\n")
+    return root
 
 
 @dataclass(frozen=True)
@@ -279,6 +142,12 @@ def check_case(record: CaseRecord) -> CaseCheck:
                      "x".join(map(str, shape)), "x".join(map(str, spacing)), body, low, high, "; ".join(problems))
 
 
+def read_manifest(path: str | Path) -> pd.DataFrame:
+    frame = pd.read_csv(path, dtype={"task": str, "case_id": str}, keep_default_na=False)
+    frame["ok"] = frame["ok"].astype(str).str.lower() == "true"
+    return frame
+
+
 def validate_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2")) -> pd.DataFrame:
     """Check every case of the requested tasks; update ``<root>/manifest.csv``, keeping rows of other tasks."""
     tasks = set(tasks)
@@ -287,116 +156,60 @@ def validate_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2")) -> pd.
     path = Path(root) / "manifest.csv"
     if not frame.empty:
         if path.exists():
-            previous = pd.read_csv(path, dtype={"task": str, "case_id": str}, keep_default_na=False)
-            previous["ok"] = previous["ok"].astype(str).str.lower() == "true"
+            previous = read_manifest(path)
             frame = pd.concat([previous[~previous["task"].isin(tasks)], frame], ignore_index=True)
         frame.sort_values("case_id").to_csv(path, index=False)
     return frame[frame["task"].isin(tasks)] if not frame.empty else frame
 
 
-def _extracted_marker(root: Path, remote: RemoteFile) -> Path:
-    return root / _TASK_DIR[remote.task] / f".extracted-{remote.md5 or remote.size}"
-
-
-def prepare(root: str | Path, tasks: Iterable[str] = ("1", "2"), record: str = TRAINING_RECORD,
-            keep_archives: bool = True, skip_download: bool = False, skip_validation: bool = False) -> pd.DataFrame:
-    """Full pipeline for the requested tasks; returns the manifest (empty if validation is skipped).
-
-    Archives are processed one at a time (download, MD5, extract, optionally delete), so that with
-    ``keep_archives=False`` the disk only ever holds one archive next to the extracted cases. A marker per archive
-    records a completed extraction, so a deleted archive is never downloaded again.
-    """
-    root = Path(root)
-    tasks = tuple(sorted(set(tasks)))
-    archives = root / "archives"
-    if skip_download:
-        for path in sorted(archives.glob("*.zip")):
-            task = next((t for t, name in _TASK_DIR.items() if name.lower() in path.name.lower()), None)
-            if task in tasks:
-                print(f"extracting {path.name}: {extract_archive(path, root, task)} files written", file=sys.stderr)
-    else:
-        remote = [f for f in list_record_files(record) if f.key.endswith(".zip") and f.task in tasks]
-        if not remote:
-            raise RuntimeError(f"no archive for tasks {tasks} in record {record}")
-        pending = [f for f in remote if not _extracted_marker(root, f).exists()]
-        archives.mkdir(parents=True, exist_ok=True)
-        # extracted .mha are already compressed, so a case takes about as much space as its share of the archive
-        needed = (sum(f.size for f in pending) + (max((f.size for f in pending), default=0) if not keep_archives
-                                                  else sum(f.size for f in pending)))
-        free = shutil.disk_usage(archives).free
-        if free < needed:
-            print(f"warning: {free / 2**30:.1f} GiB free; about {needed / 2**30:.1f} GiB needed", file=sys.stderr)
-        for remote_file in pending:
-            path = download_file(remote_file, archives / remote_file.key)
-            written = extract_archive(path, root, remote_file.task)
-            print(f"extracted {path.name}: {written} files written", file=sys.stderr)
-            _extracted_marker(root, remote_file).write_text(f"{remote_file.key}\n")
-            if not keep_archives:
-                path.unlink()
-
-    if skip_validation:
-        return pd.DataFrame()
-    return validate_dataset(root, tasks)
-
-
-def has_cases(root: str | Path) -> bool:
-    root = Path(root)
-    return root.exists() and next(root.rglob("ct.mha"), None) is not None
-
-
 def ensure_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2"), download: bool = True,
-                   keep_archives: bool = True) -> Path:
-    """Return ``root`` once it holds the real SynthRAD2025 cases of ``tasks``, downloading the missing tasks.
+                   repo_id: str | None = None, revision: str | None = None) -> Path:
+    """Return ``root`` once it holds the SynthRAD2025 cases of ``tasks``, fetching the missing tasks from Hugging Face.
 
-    Archives already in ``<root>/archives`` are reused and interrupted downloads resume. With ``download=False`` a
-    missing task raises instead.
+    A task fetched before (marker present) needs no network. With ``download=False`` the cases already in ``root``
+    are used as they are and a task without any case raises.
     """
     root = Path(root)
     tasks = tuple(sorted(set(tasks)))
+    repo_id, revision = repo_id or dataset_repo(), revision or dataset_revision()
+    if download:
+        if pending := [t for t in tasks if not _fetched_marker(root, t, repo_id, revision).exists()]:
+            fetch(root, pending, repo_id=repo_id, revision=revision)
     present = {record.task for record in discover_cases(root)} if root.exists() else set()
-    missing = [task for task in tasks if task not in present]
-    if missing:
-        if not download:
-            raise FileNotFoundError(f"no SynthRAD2025 case of task(s) {', '.join(missing)} under {root}; run "
-                                    f"`sctrange-download --root {root}` or allow the download")
-        prepare(root, missing, keep_archives=keep_archives)
-        present = {record.task for record in discover_cases(root)}
-        if still := [task for task in missing if task not in present]:
-            raise FileNotFoundError(f"{root} holds no case of task(s) {', '.join(still)} after preparation")
+    if missing := [task for task in tasks if task not in present]:
+        raise FileNotFoundError(f"no SynthRAD2025 case of task(s) {', '.join(missing)} under {root}; run "
+                                f"`sctrange-download --root {root}` or allow the download")
     return root
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Download and prepare the SynthRAD2025 training data (Zenodo).")
-    parser.add_argument("--root", type=Path, help="dataset root, later used as SYNTHRAD2025_ROOT")
+    parser = argparse.ArgumentParser(description="Fetch the SynthRAD2025 training data from its Hugging Face mirror.")
+    parser.add_argument("--root", type=Path, required=True, help="dataset root, later used as SYNTHRAD2025_ROOT")
     parser.add_argument("--task", choices=("1", "2", "all"), default="all")
-    parser.add_argument("--record", default=TRAINING_RECORD, help="Zenodo record id (default: training v2)")
-    parser.add_argument("--delete-archives", action="store_true", help="remove each zip after extraction")
-    parser.add_argument("--skip-download", action="store_true", help="only extract archives already in <root>/archives")
-    parser.add_argument("--skip-validation", action="store_true")
-    parser.add_argument("--list", action="store_true", help="print the record's files and exit")
+    parser.add_argument("--region", action="append", choices=("AB", "HN", "TH"),
+                        help="only this region (repeatable; default: all regions)")
+    parser.add_argument("--repo", default=None, help=f"Hugging Face dataset (default {HF_DATASET} or SCT_HF_DATASET)")
+    parser.add_argument("--revision", default=None, help=f"tag, branch or commit (default {HF_REVISION})")
+    parser.add_argument("--validate", action="store_true",
+                        help="re-check every case locally instead of trusting the published manifest")
     args = parser.parse_args(argv)
 
-    if args.list:
-        for remote in list_record_files(args.record):
-            print(f"{remote.key}\t{remote.size / 2**30:.2f} GiB\tmd5:{remote.md5}")
-        return
-    if args.root is None:
-        parser.error("--root is required")
     tasks = ("1", "2") if args.task == "all" else (args.task,)
-    manifest = prepare(args.root, tasks, args.record, keep_archives=not args.delete_archives,
-                       skip_download=args.skip_download, skip_validation=args.skip_validation)
-    if manifest.empty:
-        if not args.skip_validation:
-            parser.error(f"no cases found under {args.root}")
-        return
+    fetch(args.root, tasks, args.region, args.repo, args.revision)
+    if args.validate or not (args.root / "manifest.csv").exists():
+        manifest = validate_dataset(args.root, tasks)
+    else:
+        manifest = read_manifest(args.root / "manifest.csv")
+        manifest = manifest[manifest["task"].isin(tasks)]
+        present = {record.case_id for record in discover_cases(args.root)}
+        manifest = manifest[manifest["case_id"].isin(present)]
     summary = manifest.groupby(["task", "region", "center"])["ok"].agg(cases="size", valid="sum")
     print(summary.to_string())
     failures = manifest[~manifest["ok"]]
     for row in failures.itertuples():
         print(f"{row.case_id}: {row.problems}", file=sys.stderr)
-    print(f"{int(manifest['ok'].sum())}/{len(manifest)} cases valid; manifest at {Path(args.root) / 'manifest.csv'}")
-    print(f"export SYNTHRAD2025_ROOT={Path(args.root).resolve()}")
+    print(f"{int(manifest['ok'].sum())}/{len(manifest)} cases valid")
+    print(f"export SYNTHRAD2025_ROOT={args.root.resolve()}")
     if len(failures):
         raise SystemExit(1)
 

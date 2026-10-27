@@ -216,3 +216,25 @@ def test_build_model_initial_outputs() -> None:
         output = model(torch.zeros(1, 4, 16, 16))
     assert output.shape[1] == 3
     assert float(torch.nn.functional.softplus(output[0, 1]).mean()) == pytest.approx(0.01, rel=0.5)
+
+
+def test_arm_improving_mae_and_tail_is_a_gain() -> None:
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    from sctrange.diagnostics import Preregistration, decide_arms
+
+    prereg = Preregistration.load(Path(__file__).resolve().parents[1] / "configs" / "s4_preregistration.json")
+    rng = np.random.default_rng(0)
+    rows = []
+    for index in range(30):
+        base = rng.normal(5, 1)
+        for arm, tail, mae in (("R3", base, 60.0), ("R4", base - 0.1, 60.0), ("R5", base - 1.0, 50.0),
+                               ("R6", base + 0.5, 70.0)):
+            rows.append({"case_id": f"c{index}", "region": "AB", "source": arm, "mae_hu": mae,
+                         "target_cvar_mm": tail + rng.normal(0, 0.05)})
+    decision = decide_arms(pd.DataFrame(rows), prereg)
+    assert decision["verdict"] == "GAIN"
+    assert decision["arms"]["R5"]["mae_within_tolerance"] and not decision["arms"]["R6"]["mae_within_tolerance"]
