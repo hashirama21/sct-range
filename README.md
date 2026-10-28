@@ -22,7 +22,11 @@ SynthRAD2025 data from Hugging Face, frozen split, training, evaluation, verdict
 | `s6_dosimetry` | S6 | proton and photon plans on 20 cases recomputed on R1–R6, proxy validation, pre-registered go/no-go 2 | CPU (several hours, resumable) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s6_dosimetry.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s6_dosimetry.ipynb) |
 | `s7_generative` | S7–S8 | stochastic-interpolant flow matching, η sweep, step curve, projected CRPS and calibration, comparison with R3 and R6 | GPU (T4 or 2 × T4) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s7_generative.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s7_generative.ipynb) |
 
+| `s1_s7_pipeline` | S1–S8 | the six notebooks above in order, one setup and one parameters cell, same outputs | GPU for S3, S4, S7 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s1_s7_pipeline.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s1_s7_pipeline.ipynb) |
+
 Run S1 first (with both tasks): it freezes the local test split that S2–S7 verify. S6 and S7 use the S4 runs.
+`s1_s7_pipeline` runs every stage in one go; it writes to the same `outputs/s<k>/` folders as the stage notebooks, so
+a stage can be resumed in either.
 
 | Platform | Dataset and cache | Outputs | Settings |
 |---|---|---|---|
