@@ -32,13 +32,15 @@ import SimpleITK as sitk
 import torch
 from scipy.stats import spearmanr, theilslopes
 
-from .data import CaseRecord, bounding_box, discover_cases, load_case, read_volume, spherical_target
+from .data import CaseRecord, bounding_box, discover_cases, load_case, read_prediction, spherical_target
 from .diagnostics import holm, paired_test
+from .download import usable_records
 from .evaluation import DiagnosticConfig, evaluate_case
 from .gamma import gamma_pass_rate
 from .hlut import HLUT
 from .metrics import range_error
 from .projection import ParallelBeamProjector
+from .split import load_selection, select_cases, write_selection  # noqa: F401  (part of this module's interface)
 
 AIR_HU = -1000.0
 MODALITIES = ("proton", "photon")
@@ -345,51 +347,6 @@ def engine_checks(config: DoseConfig = DoseConfig(), shape_yx: tuple[int, int] =
     return pd.DataFrame(rows)
 
 
-def select_cases(records: Sequence[CaseRecord], n_cases: int, seed: int, available: Callable[[CaseRecord], bool]
-                 = lambda record: True) -> list[str]:
-    """Deterministic region-stratified subset: largest-remainder allocation by region, hashed order within region."""
-    pool = [r for r in records if available(r)]
-    if not pool:
-        raise ValueError("no case available for dosimetry")
-    n_cases = min(n_cases, len(pool))
-    regions = sorted({r.region for r in pool})
-    counts = {g: sum(r.region == g for r in pool) for g in regions}
-    quotas = {g: n_cases * counts[g] / len(pool) for g in regions}
-    allocation = {g: int(np.floor(q)) for g, q in quotas.items()}
-    for g in sorted(regions, key=lambda g: (-(quotas[g] - allocation[g]), g))[: n_cases - sum(allocation.values())]:
-        allocation[g] += 1
-    chosen = []
-    for g in regions:
-        ids = sorted(r.case_id for r in pool if r.region == g)
-        ranked = sorted(ids, key=lambda i: hashlib.sha256(f"{seed}:dose:{i}".encode()).hexdigest())
-        chosen += ranked[: allocation[g]]
-    return sorted(chosen)
-
-
-def write_selection(case_ids: Sequence[str], path: str | Path, meta: Mapping) -> str:
-    """Write the dosimetry subset and its SHA-256 (``<path>.sha256``); refuse to change an existing selection."""
-    path = Path(path)
-    payload = json.dumps({**meta, "case_ids": sorted(case_ids)}, indent=2, sort_keys=True)
-    digest = hashlib.sha256(payload.encode()).hexdigest()
-    if path.exists():
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            raise ValueError(f"{path} exists with a different selection; delete it explicitly to reselect")
-        return digest
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload.encode())  # bytes, so that the hash holds on every platform (no newline translation)
-    path.with_suffix(path.suffix + ".sha256").write_text(digest + "\n")
-    return digest
-
-
-def load_selection(path: str | Path) -> dict:
-    path = Path(path)
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    expected = path.with_suffix(path.suffix + ".sha256").read_text().strip()
-    if digest != expected:
-        raise ValueError(f"{path} does not match its recorded hash")
-    return json.loads(path.read_text())
-
-
 # --------------------------------------------------------------------------------------------------- statistics
 
 
@@ -442,6 +399,14 @@ def proxy_validation(cases: pd.DataFrame, rays: pd.DataFrame, prereg: Mapping, n
                                ("mae_spearman", mae_only)):
             estimate, low, high = cluster_bootstrap(data, function, n_boot=n_boot, seed=seed)
             result.update({name: estimate, f"{name}_low": low, f"{name}_high": high})
+        # secondary, not part of the verdict: the bulk-density baseline is far from every arm and can carry the
+        # pooled correlation on its own, so the same statistic is reported on the trained arms only
+        arms_only = cases.loc[cases["source"] != "bulk density", ["case_id", x, y]].dropna() if "source" in cases \
+            else pd.DataFrame()
+        if len(arms_only) >= 4:
+            estimate, low, high = cluster_bootstrap(arms_only, spear, n_boot=n_boot, seed=seed)
+            result.update({"arms_only_case_spearman": estimate, "arms_only_case_spearman_low": low,
+                           "arms_only_case_spearman_high": high})
     if not rays.empty and len(rays) >= 4:
         ray_rho = float(spearmanr(rays["delta_wet_mm"], -rays["delta_r80_mm"]).statistic)
         sample = rays.sample(n=min(len(rays), max_slope_rays), random_state=seed)  # Theil-Sen is O(n^2) in memory
@@ -532,7 +497,8 @@ def dose_record(record: CaseRecord, runs_root: Path, output_dir: Path, config: D
 
     volumes = load_case(record, ("ct", "mask"))
     ct, mask, spacing = volumes["ct"].array, volumes["mask"].array, volumes["ct"].spacing
-    sources = {name: read_volume(path).array for name, path in source_paths(record, runs_root, arms, seeds).items()}
+    sources = {name: read_prediction(path, ct.shape)
+               for name, path in source_paths(record, runs_root, arms, seeds).items()}
     if include_bulk:
         sources = {"bulk density": bulk_density_sct(mask), **sources}
     result = dose_case(ct, mask, spacing, sources, HLUT.pyradplan_default(), config)
@@ -619,6 +585,9 @@ def main(argv: list[str] | None = None) -> None:
     split = load_split(args.split)
     development = set(split["development"])
     records = [r for r in discover_cases(args.data_root) if r.case_id in development and r.task == task]
+    records, excluded = usable_records(args.data_root, records)
+    for case_id, problems in excluded.items():
+        print(f"excluded {case_id}: {problems}")
     reference_dir = lambda r: args.runs_root / "seed0" / prereg["reference_arm"] / "predictions" / f"{r.case_id}.mha"  # noqa: E731
     selection_path = args.out / "dosimetry_cases.json"
     ids = select_cases(records, selection_rule["n_cases"], selection_rule["seed"], lambda r: reference_dir(r).exists())

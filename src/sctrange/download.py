@@ -162,19 +162,55 @@ def validate_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2")) -> pd.
     return frame[frame["task"].isin(tasks)] if not frame.empty else frame
 
 
+def usable_records(root: str | Path, records: Iterable[CaseRecord]) -> tuple[list[CaseRecord], dict[str, str]]:
+    """``records`` without the cases that fail the integrity check, and the reason for each excluded case.
+
+    The check comes from ``<root>/manifest.csv`` (published with the data); a case absent from it is checked here.
+    """
+    records = list(records)
+    path = Path(root) / "manifest.csv"
+    manifest = read_manifest(path).set_index("case_id") if path.exists() else pd.DataFrame(columns=["ok", "problems"])
+    usable, excluded = [], {}
+    for record in records:
+        if record.case_id in manifest.index:
+            ok, problems = bool(manifest.at[record.case_id, "ok"]), str(manifest.at[record.case_id, "problems"])
+        else:
+            check = check_case(record)
+            ok, problems = check.ok, check.problems
+        if ok:
+            usable.append(record)
+        else:
+            excluded[record.case_id] = problems
+    return usable, excluded
+
+
 def ensure_dataset(root: str | Path, tasks: Iterable[str] = ("1", "2"), download: bool = True,
-                   repo_id: str | None = None, revision: str | None = None) -> Path:
+                   repo_id: str | None = None, revision: str | None = None, attempts: int = 4) -> Path:
     """Return ``root`` once it holds the SynthRAD2025 cases of ``tasks``, fetching the missing tasks from Hugging Face.
 
-    A task fetched before (marker present) needs no network. With ``download=False`` the cases already in ``root``
-    are used as they are and a task without any case raises.
+    A task fetched before (marker present) needs no network. A download cut by a network error is retried
+    ``attempts`` times (files already complete are kept). With ``download=False`` the cases already in ``root`` are
+    used as they are and a task without any case raises.
     """
+    import time
+
     root = Path(root)
     tasks = tuple(sorted(set(tasks)))
     repo_id, revision = repo_id or dataset_repo(), revision or dataset_revision()
     if download:
         if pending := [t for t in tasks if not _fetched_marker(root, t, repo_id, revision).exists()]:
-            fetch(root, pending, repo_id=repo_id, revision=revision)
+            for attempt in range(1, attempts + 1):
+                try:
+                    fetch(root, pending, repo_id=repo_id, revision=revision)
+                    break
+                except FileNotFoundError:
+                    raise
+                except Exception as error:  # network errors of huggingface_hub, requests or the OS
+                    if attempt == attempts:
+                        raise
+                    print(f"download interrupted ({type(error).__name__}: {error}); retry {attempt}/{attempts - 1}",
+                          file=sys.stderr)
+                    time.sleep(30 * attempt)
     present = {record.task for record in discover_cases(root)} if root.exists() else set()
     if missing := [task for task in tasks if task not in present]:
         raise FileNotFoundError(f"no SynthRAD2025 case of task(s) {', '.join(missing)} under {root}; run "

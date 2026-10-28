@@ -88,6 +88,16 @@ def read_volume(path: str | Path, dtype: type = np.float32) -> Volume:
     )
 
 
+def read_prediction(path: str | Path, shape: tuple[int, ...]) -> np.ndarray:
+    """A predicted sCT, refused unless it lies on the grid of its reference CT (a stale or foreign prediction with the
+    same case id would otherwise be compared voxel by voxel with the wrong patient)."""
+    array = read_volume(path).array
+    if array.shape != tuple(shape):
+        raise ValueError(f"{path}: shape {array.shape} differs from the reference CT {tuple(shape)}; the prediction "
+                         "comes from other data (stale outputs?): delete it and its run")
+    return array
+
+
 def write_volume(array: np.ndarray, path: str | Path, like: Volume | None = None,
                  spacing: tuple[float, float, float] = (1.0, 1.0, 3.0),
                  origin: tuple[float, float, float] | None = None,

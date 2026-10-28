@@ -15,10 +15,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .data import CaseRecord, load_case, read_volume, write_volume
+from .data import CaseRecord, load_case, read_prediction, read_volume, write_volume
 from .hlut import HLUT
 from .metrics import TISSUE_EDGES_HU
 from .normalization import CT_RANGE_HU
+from .runs import files_signature, mark_complete, mark_incomplete, run_complete
 
 
 def tissue_classes(hu: np.ndarray, edges_hu: Sequence[float] = TISSUE_EDGES_HU) -> np.ndarray:
@@ -58,14 +59,25 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
     records = [r for r in records if r.case_id in folds]
     if not records:
         raise ValueError(f"no record of {source_dir / 'folds.csv'} is available")
+    ids = [r.case_id for r in records]
+    if not run_complete(source_dir, ids):
+        raise FileNotFoundError(f"{source_dir} has not finished (complete.json missing or predictions absent)")
+    signature = {"source": files_signature([source_dir / "folds.csv",
+                                            *(source_dir / "predictions" / f"{i}.mha" for i in ids)]),
+                 "edges_hu": [float(e) for e in edges_hu], "hlut": hlut.fingerprint()}
+    if run_complete(output_dir, ids) and (output_dir / "offsets.csv").exists() and \
+            json.loads((output_dir / "complete.json").read_text()).get("signature") == json.loads(json.dumps(signature)):
+        return pd.read_csv(output_dir / "offsets.csv", index_col="fold")  # same source: nothing to redo
+    mark_incomplete(output_dir)
 
-    def prediction(record: CaseRecord) -> np.ndarray:
-        return read_volume(source_dir / "predictions" / f"{record.case_id}.mha").array
+    def prediction(record: CaseRecord, shape: tuple[int, ...]) -> np.ndarray:
+        return read_prediction(source_dir / "predictions" / f"{record.case_id}.mha", shape)
 
     sums, counts = {}, {}
     for record in records:
         volumes = load_case(record, ("ct", "mask"))
-        sums[record.case_id], counts[record.case_id] = bias_sums(prediction(record), volumes["ct"].array,
+        ct = volumes["ct"].array
+        sums[record.case_id], counts[record.case_id] = bias_sums(prediction(record, ct.shape), ct,
                                                                  volumes["mask"].array, hlut, edges_hu)
     labels = [f"[{low:g}, {high:g}) HU" for low, high in zip(edges_hu[:-1], edges_hu[1:])]
     offsets = {}
@@ -89,4 +101,5 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
                                                          "edges_hu": [float(e) for e in edges_hu],
                                                          "hlut": hlut.fingerprint()}, indent=2))
     frame.to_csv(output_dir / "offsets.csv")
+    mark_complete(output_dir, ids, signature=signature)
     return frame

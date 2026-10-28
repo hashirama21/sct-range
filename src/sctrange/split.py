@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -62,6 +62,55 @@ def stratified_split(records: Iterable[CaseRecord], spec: SplitSpec = SplitSpec(
         "test": sorted(test),
         "development": sorted(development),
     }
+
+
+def select_cases(records: Sequence[CaseRecord], n_cases: int, seed: int,
+                 available: Callable[[CaseRecord], bool] = lambda record: True) -> list[str]:
+    """Deterministic region-stratified subset: largest-remainder allocation by region, hashed order within region.
+
+    Used wherever a notebook works on part of the development pool, so that a subset is never just the first case ids
+    (which all come from one region and centre).
+    """
+    pool = [r for r in records if available(r)]
+    if not pool:
+        raise ValueError("no case available")
+    n_cases = min(n_cases, len(pool))
+    regions = sorted({r.region for r in pool})
+    counts = {g: sum(r.region == g for r in pool) for g in regions}
+    quotas = {g: n_cases * counts[g] / len(pool) for g in regions}
+    allocation = {g: int(np.floor(q)) for g, q in quotas.items()}
+    for g in sorted(regions, key=lambda g: (-(quotas[g] - allocation[g]), g))[: n_cases - sum(allocation.values())]:
+        allocation[g] += 1
+    chosen = []
+    for g in regions:
+        ids = sorted(r.case_id for r in pool if r.region == g)
+        ranked = sorted(ids, key=lambda i: hashlib.sha256(f"{seed}:dose:{i}".encode()).hexdigest())
+        chosen += ranked[: allocation[g]]
+    return sorted(chosen)
+
+
+def write_selection(case_ids: Sequence[str], path: str | Path, meta: dict) -> str:
+    """Write a case subset and its SHA-256 (``<path>.sha256``); refuse to change an existing selection."""
+    path = Path(path)
+    payload = json.dumps({**meta, "case_ids": sorted(case_ids)}, indent=2, sort_keys=True)
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    if path.exists():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError(f"{path} exists with a different selection; delete it explicitly to reselect")
+        return digest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload.encode())  # bytes, so that the hash holds on every platform (no newline translation)
+    path.with_suffix(path.suffix + ".sha256").write_text(digest + "\n")
+    return digest
+
+
+def load_selection(path: str | Path) -> dict:
+    path = Path(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    expected = path.with_suffix(path.suffix + ".sha256").read_text().strip()
+    if digest != expected:
+        raise ValueError(f"{path} does not match its recorded hash")
+    return json.loads(path.read_text())
 
 
 def canonical_bytes(split: dict) -> bytes:

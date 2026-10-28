@@ -110,9 +110,9 @@ def test_generative_training_sampling_and_evaluation(fixture_root: Path, hlut: H
     assert len(rows) == len(records) and pits.shape[1] == 4
     assert {"pcrps_mm", "coverage90", "risk_fz", "target_cvar_mm", "target_global_ratio"} <= set(rows.columns)
     assert (run / "predictions" / f"{records[0].case_id}.mha").exists()
-    stamp = (run / "eval" / "K3_N2" / f"{records[0].case_id}.json").stat().st_mtime_ns
+    stamp = (run / "eval" / "K3_N2_kappa0.1_seed0" / f"{records[0].case_id}.json").stat().st_mtime_ns
     again, _ = evaluate_generative(records, cache, run, config, hlut, diagnostic, 3, 2, "cpu")
-    assert (run / "eval" / "K3_N2" / f"{records[0].case_id}.json").stat().st_mtime_ns == stamp
+    assert (run / "eval" / "K3_N2_kappa0.1_seed0" / f"{records[0].case_id}.json").stat().st_mtime_ns == stamp
     pd.testing.assert_frame_equal(rows, again)
     with pytest.raises(ValueError):
         crossfit_generative(records, cache, GenerativeConfig(eta=0.2, **TINY), 2, run)

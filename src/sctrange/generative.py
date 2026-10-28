@@ -41,6 +41,7 @@ from torch.nn import functional as F
 
 from .cache import CachedCase, VolumeCache
 from .data import CaseRecord, bounding_box, write_volume
+from .download import usable_records
 from .evaluation import DiagnosticConfig, evaluate_prepared, prepare_case
 from .hlut import HLUT
 from .losses import fz_upper_tail_loss
@@ -48,7 +49,9 @@ from .metrics import mae_hu, range_error, summarize
 from .models import _groups
 from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .scoring import crps_ensemble
-from .training import PatchSampler, _schedule, assign_folds, autocast_dtype, source_stack, uncrop
+from .runs import ids_hash
+from .training import (PatchSampler, _schedule, assign_folds, autocast_dtype, check_checkpoint, fold_seed,
+                       load_progress, progress_key, save_progress, source_stack, uncrop)
 
 _RUNTIME_FIELDS = ("device", "amp", "log_every", "diffusion")  # diffusion only affects sampling
 
@@ -207,7 +210,10 @@ def flow_matching_loss(model: TimeUNet2d, inputs: torch.Tensor, targets_hu: torc
     return loss, parts
 
 
-def train_generative(cases: list[CachedCase], config: GenerativeConfig) -> tuple[TimeUNet2d, pd.DataFrame]:
+def train_generative(cases: list[CachedCase], config: GenerativeConfig, resume_path: str | Path | None = None,
+                     checkpoint_every: int = 1000) -> tuple[TimeUNet2d, pd.DataFrame]:
+    """Train one generator; with ``resume_path`` the training state is saved every ``checkpoint_every`` steps and an
+    interrupted job continues from its last save (``sctrange.training.train_model``)."""
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
     device = torch.device(config.device)
@@ -218,9 +224,14 @@ def train_generative(cases: list[CachedCase], config: GenerativeConfig) -> tuple
     sampler = PatchSampler(cases, config, rng)
     amp_dtype = autocast_dtype(device) if config.amp else None
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
-    history, running, start = [], defaultdict(list), time.perf_counter()
+    resume_path = Path(resume_path) if resume_path is not None else None
+    key = progress_key(config, [case.case_id for case in cases])
+    modules = {"model": model, "optimizer": optimizer, "scheduler": scheduler, "scaler": scaler}
+    first_step, history = load_progress(resume_path, key, modules, {"sampler": rng}, {"noise": generator})
+    running = defaultdict(list)
+    start = time.perf_counter() - (history[-1]["seconds"] if history else 0.0)
     model.train()
-    for step in range(config.steps):
+    for step in range(first_step, config.steps):
         inputs, targets, masks = (tensor.to(device, non_blocking=True) for tensor in sampler.batch())
         with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
             loss, parts = flow_matching_loss(model, inputs, targets, masks, config, generator)
@@ -239,16 +250,15 @@ def train_generative(cases: list[CachedCase], config: GenerativeConfig) -> tuple
             history.append({"step": step + 1, **row, "learning_rate": scheduler.get_last_lr()[0],
                             "seconds": time.perf_counter() - start})
             running = defaultdict(list)
+        if resume_path is not None and not running and (step + 1) % checkpoint_every == 0 and step + 1 < config.steps:
+            save_progress(resume_path, step + 1, key, modules, history, {"sampler": rng}, {"noise": generator})
     return model.eval(), pd.DataFrame(history)
 
 
-def _load_generator(path: Path, config: GenerativeConfig) -> TimeUNet2d:
+def _load_generator(path: Path, config: GenerativeConfig, training_ids: Sequence[str] | None = None) -> TimeUNet2d:
+    """Generator from a fold checkpoint; refuses another configuration or another training set."""
     state = torch.load(path, map_location=config.device, weights_only=True)
-    saved = {k: v for k, v in json.loads(json.dumps(state["config"])).items() if k not in _RUNTIME_FIELDS and k != "seed"}
-    current = {k: v for k, v in config.comparable().items() if k != "seed"}
-    if saved != current:
-        changed = sorted(k for k in current if saved.get(k) != current[k])
-        raise ValueError(f"{path} was trained with a different configuration ({', '.join(changed)})")
+    check_checkpoint(state, path, {k: v for k, v in config.comparable().items() if k != "seed"}, training_ids)
     model = build_generator(config).to(config.device)
     model.load_state_dict(state["state_dict"])
     return model.eval()
@@ -256,11 +266,16 @@ def _load_generator(path: Path, config: GenerativeConfig) -> TimeUNet2d:
 
 def train_generative_fold(cache: VolumeCache, case_ids: list[str], config: GenerativeConfig, fold: int,
                           checkpoint: str | Path, device: str) -> pd.DataFrame:
+    checkpoint = Path(checkpoint)
+    partial = checkpoint.with_suffix(".partial.pt")
     cases = [cache.load(case_id) for case_id in case_ids]
-    model, history = train_generative(cases, replace(config, seed=config.seed + fold, device=device))
-    temporary = Path(checkpoint).with_suffix(".pt.tmp")
-    torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold}, temporary)
+    model, history = train_generative(cases, replace(config, seed=fold_seed(config.seed, fold), device=device),
+                                      resume_path=partial)
+    temporary = checkpoint.with_suffix(".pt.tmp")
+    torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold,
+                "training_cases": ids_hash(case_ids)}, temporary)
     temporary.replace(checkpoint)
+    partial.unlink(missing_ok=True)
     return history.assign(fold=fold, device=device)
 
 
@@ -287,9 +302,11 @@ def crossfit_generative(records: list[CaseRecord], cache: VolumeCache, config: G
     frame.to_csv(output_dir / "folds.csv", index=False)
     history_path = output_dir / "history.csv"
 
+    def training_ids(fold: int) -> list[str]:
+        return [r.case_id for r in records if folds[r.case_id] != fold]
+
     def job(fold: int, device: str) -> tuple:
-        training = [r.case_id for r in records if folds[r.case_id] != fold]
-        return cache, training, config, fold, output_dir / f"fold{fold}.pt", device
+        return cache, training_ids(fold), config, fold, output_dir / f"fold{fold}.pt", device
 
     def append(history: pd.DataFrame) -> None:
         previous = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
@@ -299,7 +316,7 @@ def crossfit_generative(records: list[CaseRecord], cache: VolumeCache, config: G
     for fold in range(n_folds):
         checkpoint = output_dir / f"fold{fold}.pt"
         if checkpoint.exists():
-            _load_generator(checkpoint, replace(config, device="cpu"))
+            _load_generator(checkpoint, replace(config, device="cpu"), training_ids(fold))
         else:
             pending.append(fold)
     if len(devices) > 1 and len(pending) > 1:
@@ -456,7 +473,7 @@ def evaluate_generative(records: Sequence[CaseRecord], cache: VolumeCache, run_d
     """Sample every record with the model of its held-out fold and evaluate; results are cached per case under
     ``<run_dir>/eval/K<k>_N<n>/`` and reused on rerun. Returns per-case rows and PIT rank counts."""
     run_dir = Path(run_dir)
-    tag = f"K{n_samples}_N{n_steps}{'' if full else '_fast'}"
+    tag = f"K{n_samples}_N{n_steps}_kappa{config.diffusion:g}_seed{seed}{'' if full else '_fast'}"
     eval_dir = run_dir / "eval" / tag
     eval_dir.mkdir(parents=True, exist_ok=True)
     folds = pd.read_csv(run_dir / "folds.csv", dtype={"case_id": str}).set_index("case_id")["fold"].to_dict()
@@ -471,7 +488,8 @@ def evaluate_generative(records: Sequence[CaseRecord], cache: VolumeCache, run_d
             continue
         fold = folds[record.case_id]
         if fold not in models:
-            models[fold] = _load_generator(run_dir / f"fold{fold}.pt", replace(config, device=device))
+            training = [case_id for case_id, k in folds.items() if k != fold]
+            models[fold] = _load_generator(run_dir / f"fold{fold}.pt", replace(config, device=device), training)
         case = cache.load(record.case_id)
         case_seed = seed + int.from_bytes(record.case_id.encode()[-4:], "little")
         samples = sample_case(models[fold], case, config, n_samples, n_steps, device, case_seed)
@@ -589,6 +607,9 @@ def main(argv: list[str] | None = None) -> None:
     split = load_split(args.split)
     development = set(split["development"])
     records = [r for r in discover_cases(args.data_root) if r.case_id in development and r.task == args.task]
+    records, excluded = usable_records(args.data_root, records)
+    for case_id, problems in excluded.items():
+        print(f"excluded {case_id}: {problems}")
     if not records:
         parser.error("no development cases found for this task")
     devices = args.devices.split(",") if args.devices else visible_devices()

@@ -250,7 +250,12 @@ def plot_tail_ecdf(errors: dict[float, np.ndarray], level: float = 0.9) -> plt.F
 
 
 def plot_training_curves(histories: dict[str, pd.DataFrame]) -> plt.Figure:
-    """One panel per loss (units differ); one line per fold."""
+    """One panel per loss (units differ); one line per fold. Without any history, a single panel says so."""
+    if not histories:
+        fig, ax = plt.subplots(figsize=(5.2, 1.2))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "no training history yet", ha="center", va="center", color=INK_SECONDARY)
+        return fig
     fig, axes = plt.subplots(1, len(histories), figsize=(5.2 * len(histories), 3.4), squeeze=False)
     for ax, (loss, history) in zip(axes[0], histories.items()):
         for _, fold in history.groupby("fold"):

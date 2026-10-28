@@ -35,11 +35,13 @@ from torch.nn import functional as F
 
 from .cache import CachedCase, VolumeCache
 from .data import CaseRecord, discover_cases, write_volume
+from .download import usable_records
 from .hlut import HLUT
 from .losses import fz_upper_tail_loss, ray_risk
 from .models import UNet2d
 from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .projection import ParallelBeamProjector
+from .runs import ids_hash, mark_complete, mark_incomplete
 from .split import load_split
 
 LOSSES = ("l1_hu", "l2_hu", "l2_spr")
@@ -257,8 +259,64 @@ def autocast_dtype(device: torch.device) -> torch.dtype | None:
     return torch.bfloat16 if torch.cuda.get_device_capability(device) >= (8, 0) else torch.float16
 
 
-def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT) -> tuple[UNet2d, pd.DataFrame]:
-    """Train one model; returns it in eval mode with the logged history."""
+def fold_seed(seed: int, fold: int) -> int:
+    """Seed of the model of ``fold`` in a run of seed ``seed``; distinct runs never share a fold seed
+    (``seed + fold`` would give run 0 / fold 1 the initialisation and patch stream of run 1 / fold 0)."""
+    return int.from_bytes(hashlib.sha256(f"{seed}:fold:{fold}".encode()).digest()[:4], "little")
+
+
+def progress_key(config, case_ids) -> str:
+    """Identity of a training job: the experiment configuration (seed included) and its training cases."""
+    return json.dumps({"config": config.comparable(), "cases": ids_hash(case_ids)}, sort_keys=True)
+
+
+def save_progress(path: Path, step: int, key: str, modules: dict, history: list[dict],
+                  numpy_rngs: dict[str, np.random.Generator], generators: dict[str, torch.Generator]) -> None:
+    """Everything needed to continue an interrupted training job exactly where it stopped (atomic write)."""
+    state = {"step": step, "key": key, "history": json.dumps(history),
+             "rng": json.dumps({name: g.bit_generator.state for name, g in numpy_rngs.items()}),
+             "torch_rng": torch.get_rng_state(),
+             **{f"module_{name}": module.state_dict() for name, module in modules.items()},
+             **{f"generator_{name}": g.get_state() for name, g in generators.items()}}
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()
+    temporary = path.with_suffix(".tmp")
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def load_progress(path: Path | None, key: str, modules: dict, numpy_rngs: dict[str, np.random.Generator],
+                  generators: dict[str, torch.Generator]) -> tuple[int, list[dict]]:
+    """Restore a job saved by ``save_progress``; returns ``(next step, history)``, ``(0, [])`` when there is nothing
+    to resume or the saved job is another experiment."""
+    if path is None or not path.exists():
+        return 0, []
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:  # truncated file: start the fold again
+        return 0, []
+    if state.get("key") != key:
+        return 0, []
+    for name, module in modules.items():
+        module.load_state_dict(state[f"module_{name}"])
+    for name, g in numpy_rngs.items():
+        g.bit_generator.state = json.loads(state["rng"])[name]
+    for name, g in generators.items():
+        g.set_state(state[f"generator_{name}"])
+    torch.set_rng_state(state["torch_rng"])
+    if "cuda_rng" in state and torch.cuda.is_available() and len(state["cuda_rng"]) == torch.cuda.device_count():
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    return int(state["step"]), json.loads(state["history"])
+
+
+def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT, resume_path: str | Path | None = None,
+                checkpoint_every: int = 1000) -> tuple[UNet2d, pd.DataFrame]:
+    """Train one model; returns it in eval mode with the logged history.
+
+    With ``resume_path``, the full training state (weights, optimiser, schedule, loss scaling, random streams) is saved
+    there every ``checkpoint_every`` steps and restored on the next call, so a job cut by a session timeout continues
+    from its last save and ends with the same model as an uninterrupted run.
+    """
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
     angle_rng = np.random.default_rng([config.seed, 1])
@@ -270,9 +328,15 @@ def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT) -> tup
     amp_dtype = autocast_dtype(device) if config.amp else None
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
 
-    history, running, start = [], defaultdict(list), time.perf_counter()
+    resume_path = Path(resume_path) if resume_path is not None else None
+    key = progress_key(config, [case.case_id for case in cases])
+    modules = {"model": model, "optimizer": optimizer, "scheduler": scheduler, "scaler": scaler}
+    rngs = {"sampler": rng, "angles": angle_rng}
+    first_step, history = load_progress(resume_path, key, modules, rngs, {})
+    running = defaultdict(list)
+    start = time.perf_counter() - (history[-1]["seconds"] if history else 0.0)
     model.train()
-    for step in range(config.steps):
+    for step in range(first_step, config.steps):
         inputs, targets, masks = (tensor.to(device, non_blocking=True) for tensor in sampler.batch())
         with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
             output = model(inputs)
@@ -294,6 +358,8 @@ def train_model(cases: list[CachedCase], config: TrainConfig, hlut: HLUT) -> tup
             history.append({"step": step + 1, **row, "learning_rate": scheduler.get_last_lr()[0],
                             "seconds": time.perf_counter() - start})
             running = defaultdict(list)
+        if resume_path is not None and not running and (step + 1) % checkpoint_every == 0 and step + 1 < config.steps:
+            save_progress(resume_path, step + 1, key, modules, history, rngs, {})
     return model.eval(), pd.DataFrame(history)
 
 
@@ -346,17 +412,23 @@ def assign_folds(records: list[CaseRecord], n_folds: int, seed: int) -> dict[str
     return folds
 
 
-def _load_checkpoint(path: Path, config: TrainConfig) -> UNet2d:
-    """Model from a fold checkpoint; refuses a checkpoint trained with a different experiment configuration."""
-    state = torch.load(path, map_location=config.device, weights_only=True)
-    saved = {k: v for k, v in json.loads(json.dumps(state["config"])).items() if k not in _RUNTIME_FIELDS and k != "seed"}
-    current = {k: v for k, v in config.comparable().items() if k != "seed"}
-    defaults = TrainConfig(loss=config.loss).comparable()
-    saved = {**{k: defaults[k] for k in current if k not in saved}, **saved}  # checkpoints from before new fields
+def check_checkpoint(state: dict, path: Path, current: dict, training_ids: Sequence[str] | None) -> None:
+    """Refuse a fold checkpoint of another experiment, or one trained on other cases than this fold's training set
+    (reusing it would predict cases the model has seen: the predictions would no longer be out of fold)."""
+    saved = {k: v for k, v in json.loads(json.dumps(state["config"])).items() if k in current}
     if saved != current:
         changed = sorted(k for k in current if saved.get(k) != current[k])
-        raise ValueError(f"{path} was trained with a different configuration ({', '.join(changed)}); "
-                         "use another output directory")
+        raise ValueError(f"{path} was trained with a different configuration ({', '.join(changed)}); use another "
+                         "output directory (SCT_RUNS_ROOT / SCT_GEN_RUNS_ROOT in the notebooks) or delete it")
+    if training_ids is not None and state.get("training_cases") != ids_hash(training_ids):
+        raise ValueError(f"{path} was trained on other cases than this fold's training set (the development pool or "
+                         "the folds changed); delete the run directory to retrain it")
+
+
+def _load_checkpoint(path: Path, config: TrainConfig, training_ids: Sequence[str] | None = None) -> UNet2d:
+    """Model from a fold checkpoint, after ``check_checkpoint``."""
+    state = torch.load(path, map_location=config.device, weights_only=True)
+    check_checkpoint(state, path, {k: v for k, v in config.comparable().items() if k != "seed"}, training_ids)
     model = build_model(config).to(config.device)
     model.load_state_dict(state["state_dict"])
     return model.eval()
@@ -372,13 +444,19 @@ def train_fold(cache: VolumeCache, case_ids: list[str], config: TrainConfig, hlu
     """Train the model of one fold on ``device`` and save its checkpoint; returns the history.
 
     Top-level and argument-picklable so that folds can run in parallel processes, one per GPU.
-    ``config`` is the run configuration; the fold's model uses seed ``config.seed + fold``.
+    ``config`` is the run configuration; the fold's model uses seed ``fold_seed(config.seed, fold)``. Progress is saved
+    to ``fold<k>.partial.pt`` while training, so a fold cut by a session timeout resumes from its last save.
     """
+    checkpoint = Path(checkpoint)
+    partial = checkpoint.with_suffix(".partial.pt")
     cases = [cache.load(case_id) for case_id in case_ids]
-    model, history = train_model(cases, replace(config, seed=config.seed + fold, device=device), hlut)
-    temporary = Path(checkpoint).with_suffix(".pt.tmp")
-    torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold}, temporary)
+    model, history = train_model(cases, replace(config, seed=fold_seed(config.seed, fold), device=device), hlut,
+                                 resume_path=partial)
+    temporary = checkpoint.with_suffix(".pt.tmp")
+    torch.save({"state_dict": model.state_dict(), "config": asdict(config), "fold": fold,
+                "training_cases": ids_hash(case_ids)}, temporary)
     temporary.replace(checkpoint)
+    partial.unlink(missing_ok=True)
     return history.assign(fold=fold, device=device)
 
 
@@ -406,6 +484,7 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
     output_dir = Path(output_dir)
     devices = list(devices or [config.device])
     (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    mark_incomplete(output_dir)  # set again once every prediction is written
     (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2))
     folds = assign_folds(records, n_folds, config.seed)
     frame = pd.DataFrame(sorted(folds.items()), columns=["case_id", "fold"])
@@ -413,15 +492,17 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
     history_path = output_dir / "history.csv"
     with_risk = config.out_channels > 1
 
+    def training_ids(fold: int) -> list[str]:
+        return [r.case_id for r in records if folds[r.case_id] != fold]
+
     def job(fold: int, device: str) -> tuple:
-        training = [r.case_id for r in records if folds[r.case_id] != fold]
-        return cache, training, config, hlut, fold, output_dir / f"fold{fold}.pt", device
+        return cache, training_ids(fold), config, hlut, fold, output_dir / f"fold{fold}.pt", device
 
     pending = []
     for fold in range(n_folds):
         checkpoint = output_dir / f"fold{fold}.pt"
         if checkpoint.exists():
-            _load_checkpoint(checkpoint, config)  # refuses a checkpoint trained with another configuration
+            _load_checkpoint(checkpoint, config, training_ids(fold))  # refuses another configuration or case set
         else:
             pending.append(fold)
     if len(devices) > 1 and len(pending) > 1:
@@ -438,7 +519,7 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
 
     device = devices[0]
     for fold in range(n_folds):
-        model = _load_checkpoint(output_dir / f"fold{fold}.pt", replace(config, device=device))
+        model = _load_checkpoint(output_dir / f"fold{fold}.pt", replace(config, device=device), training_ids(fold))
         for case_id in (r.case_id for r in records if folds[r.case_id] == fold):
             case = cache.load(case_id)
             if with_risk:
@@ -449,6 +530,7 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
             else:
                 sct = predict_case(model, case, config.context, device)
             _write_prediction(sct, case, output_dir / "predictions" / f"{case_id}.mha")
+    mark_complete(output_dir, folds, config=config.comparable(), folds=n_folds)
     return frame
 
 
@@ -481,6 +563,9 @@ def main(argv: list[str] | None = None) -> None:
     split = load_split(args.split)
     development = set(split["development"])
     records = [r for r in discover_cases(args.data_root) if r.case_id in development and r.task == args.task]
+    records, excluded = usable_records(args.data_root, records)
+    for case_id, problems in excluded.items():
+        print(f"excluded {case_id}: {problems}")
     if not records:
         parser.error("no development cases found for this task")
     hlut = HLUT.pyradplan_default()

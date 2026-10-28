@@ -11,7 +11,12 @@ import numpy as np
 from .data import CaseRecord, bounding_box, load_case
 from .normalization import CT_RANGE_HU, normalize_source
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+
+
+def source_signature(record: CaseRecord) -> dict[str, int]:
+    """Size in bytes of the source files of a case: re-downloading the same release keeps it, other data change it."""
+    return {name: record.path(name).stat().st_size for name in ("ct", "mask", record.source_name)}
 
 
 @dataclass(frozen=True)
@@ -39,15 +44,22 @@ class VolumeCache:
     def _meta_path(self, case_id: str) -> Path:
         return self.root / case_id / "meta.json"
 
-    def is_current(self, case_id: str) -> bool:
+    def is_current(self, case_id: str, record: CaseRecord | None = None) -> bool:
+        """Cached with this cache version and, when ``record`` is given, from these very source files (a case id is not
+        enough: another dataset copy or a fixture can reuse it)."""
         path = self._meta_path(case_id)
-        return path.exists() and json.loads(path.read_text()).get("cache_version") == CACHE_VERSION
+        if not path.exists():
+            return False
+        meta = json.loads(path.read_text())
+        if meta.get("cache_version") != CACHE_VERSION:
+            return False
+        return record is None or meta.get("source_files") == source_signature(record)
 
     def build(self, records: list[CaseRecord], overwrite: bool = False) -> int:
         """Cache every record that is missing or stale; return the number of cases written."""
         written = 0
         for record in records:
-            if self.is_current(record.case_id) and not overwrite:
+            if self.is_current(record.case_id, record) and not overwrite:
                 continue
             volumes = load_case(record, ("ct", "mask", record.source_name))
             ct, mask = volumes["ct"], volumes["mask"].array
@@ -67,6 +79,7 @@ class VolumeCache:
                 "spacing": list(ct.spacing),
                 "origin": list(ct.origin),
                 "direction": list(ct.direction),
+                "source_files": source_signature(record),
             }
             self._meta_path(record.case_id).write_text(json.dumps(meta, indent=2))
             written += 1

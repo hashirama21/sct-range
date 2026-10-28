@@ -16,6 +16,7 @@ from sctrange.metrics import TISSUE_EDGES_HU
 from sctrange.normalization import encode_ct
 from sctrange.phantoms import disk, write_fixture_dataset
 from sctrange.projection import ParallelBeamProjector
+from sctrange.runs import mark_complete, run_complete
 from sctrange.training import (
     ARMS,
     TrainConfig,
@@ -162,11 +163,19 @@ def test_crossfit_bias_correction_is_leak_free(fixture_root: Path, hlut: HLUT, t
         ct = load_case(record, ("ct",))["ct"]
         write_volume(ct.array + (30.0 if folds[record.case_id] == 0 else -30.0), source / "predictions" /
                      f"{record.case_id}.mha", like=ct)
+    with pytest.raises(FileNotFoundError, match="has not finished"):
+        crossfit_bias_correction(records, source, tmp_path / "R4", hlut)
+    mark_complete(source, folds)
     offsets = crossfit_bias_correction(records, source, tmp_path / "R4", hlut)
     # the offsets for fold 0 come from fold 1 (sCT too low there), so they are positive in soft tissue
     soft = "[-100, 150) HU"
     assert offsets.loc[0, soft] > 0 > offsets.loc[1, soft]
     assert len(list((tmp_path / "R4" / "predictions").glob("*.mha"))) == len(records)
+    assert run_complete(tmp_path / "R4", folds)
+    stamp = (tmp_path / "R4" / "offsets.csv").stat().st_mtime_ns
+    pd.testing.assert_frame_equal(crossfit_bias_correction(records, source, tmp_path / "R4", hlut), offsets,
+                                  check_dtype=False)
+    assert (tmp_path / "R4" / "offsets.csv").stat().st_mtime_ns == stamp  # unchanged source: not recomputed
 
 
 def test_r4_cli_requires_r3(fixture_root: Path, tmp_path: Path) -> None:

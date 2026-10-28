@@ -7,6 +7,19 @@ water-equivalent range error, ray by ray, using the same HU → SPR conversion a
 engine of the SynthRAD2025 evaluation (pyRadPlan).
 
 
+## Full pipeline in one notebook
+
+[`notebooks/s1_s7_pipeline.ipynb`](notebooks/s1_s7_pipeline.ipynb) runs weeks 1 to 7 (S1, S2, S3, S4–S5, S6, S7–S8) in
+order with one setup cell and one parameters form:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashirama21/sct-range/blob/main/notebooks/s1_s7_pipeline.ipynb) [![Open In Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/hashirama21/sct-range/blob/main/notebooks/s1_s7_pipeline.ipynb)
+
+It resumes by itself: after a crash, an error or an expired Colab/Kaggle session, *Run all* again with the same
+parameters. Finished stages are skipped (`outputs/pipeline_state.json`, kept with the outputs on Drive or in
+`/kaggle/working`), the stage that stopped continues from its fold checkpoints, from the last in-fold save of the fold
+it was training (every 1000 steps, same model as an uninterrupted run) and from its cached per-case results.
+`FORCE_STAGES` runs finished stages again. It is generated from the stage notebooks below
+(`python tools/build_pipeline_notebook.py`; a test fails while it is out of date).
+
 ## Notebooks
 
 Click a badge to open a notebook directly on Colab or Kaggle, then run all cells: the first cell installs `sctrange`
@@ -36,11 +49,12 @@ a stage can be resumed in either.
 
 - **Two GPUs** (Kaggle T4 × 2): missing folds train in parallel, one process per GPU; prediction runs on the first.
 - **T4**: no native bfloat16, so training uses float16 autocast with loss scaling (bfloat16 on Ampere and newer).
-- **Sessions end**: every fold is checkpointed in the outputs; rerunning the notebook resumes where it stopped. On
+- **Sessions end**: every fold is checkpointed in the outputs, and a fold in training saves its full state every 1000 steps; rerunning the notebook resumes where it stopped (evaluations are cached per case). On
   Colab the outputs stay in Drive. On Kaggle, *Save Version* keeps `/kaggle/working`; to continue, add that version's
   output as an input (*Add Input → Your Work*): when `/kaggle/working/outputs` is empty, the notebook copies the
   attached `outputs/` back before starting. Predictions are
-  stored as int16 HU to fit the 20 GB of `/kaggle/working`.
+  stored as int16 HU to save space; S4 prints the size of its runs and a projection for all 18 runs: check it against
+  the 20 GB of `/kaggle/working` (or the free space of Drive) after the first finished run.
 - The data come from the Hugging Face mirror (about 14 GB per task, fetched once per session, resumable).
 
 ## Install
@@ -130,7 +144,7 @@ Train cross-fitted models on the development cases (GPU recommended), then run t
 ```bash
 for loss in l1_hu l2_spr; do
   sctrange-train --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-    --cache-dir outputs/s3/cache --out outputs/s3/runs --loss $loss --task 1 --folds 5
+    --cache-dir outputs/cache --out outputs/s3/runs --loss $loss --task 1 --folds 5
 done
 jupyter nbconvert --to notebook --execute --inplace notebooks/s3_real_diagnostic.ipynb
 ```
@@ -153,10 +167,10 @@ never loaded. The cache takes roughly 60 MB per case.
 for seed in 0 1 2; do
   for arm in R1 R2 R3 R5 R6; do
     sctrange-train --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-      --cache-dir outputs/s4/cache --out outputs/s4/runs/seed$seed --arm $arm --task 1 --folds 5 --seed $seed
+      --cache-dir outputs/cache --out outputs/s4/runs/seed$seed --arm $arm --task 1 --folds 5 --seed $seed
   done
   sctrange-train --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-    --cache-dir outputs/s4/cache --out outputs/s4/runs/seed$seed --arm R4 --task 1
+    --cache-dir outputs/cache --out outputs/s4/runs/seed$seed --arm R4 --task 1
 done
 jupyter nbconvert --to notebook --execute --inplace notebooks/s4_regression_arms.ipynb
 ```
@@ -197,7 +211,7 @@ SUFFICES, NO-GO). Beam angles follow the projector convention; pyRadPlan's gantr
 
 ```bash
 sctrange-generative --data-root "$SYNTHRAD2025_ROOT" --split splits/synthrad2025_local_test.json \
-  --cache-dir outputs/s4/cache --out outputs/s7/runs --eta 0 0.05 0.1 0.2 --task 1 --folds 5
+  --cache-dir outputs/cache --out outputs/s7/runs --eta 0 0.05 0.1 0.2 --task 1 --folds 5
 jupyter nbconvert --to notebook --execute --inplace notebooks/s7_generative.ipynb
 ```
 

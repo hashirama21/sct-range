@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sctrange"
-version = "0.5.0"
+version = "0.6.0"
 description = "Range-aware evaluation and training utilities for synthetic CT (SynthRAD2025)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ sctrange-generative = "sctrange.generative:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["sctrange*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
