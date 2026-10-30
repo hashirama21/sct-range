@@ -100,23 +100,34 @@ def synthetic_prediction(ct: np.ndarray, mask: np.ndarray, rng: np.random.Genera
     return np.where(mask > 0.5, blurred + noise, -1000.0).astype(np.float32)
 
 
+def synthetic_cbct(ct: np.ndarray, mask: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """CBCT-like source: the CT with a smooth shading artefact, noise and a global intensity offset."""
+    z, y, x = np.indices(ct.shape).astype(np.float32)
+    shading = 60.0 * np.cos(2 * np.pi * (y / ct.shape[1] + rng.uniform())) * np.cos(np.pi * x / ct.shape[2])
+    noisy = ct + shading + rng.normal(0, 25, ct.shape) + rng.uniform(-80, 80)
+    return np.where(mask > 0.5, noisy, -1000.0).astype(np.float32)
+
+
 def write_fixture_dataset(root: str | Path, prediction_root: str | Path | None = None,
                           regions: tuple[str, ...] = ("AB", "HN", "TH"), centers: tuple[str, ...] = ("A", "B"),
                           cases_per_stratum: int = 5, shape_yx: tuple[int, int] = (192, 256),
-                          n_slices: int = 6, seed: int = 0) -> list[str]:
-    """Write a Task 1 fixture in the SynthRAD2025 layout and optional synthetic predictions."""
+                          n_slices: int = 6, seed: int = 0, task: str = "1") -> list[str]:
+    """Write a Task 1 (MR) or Task 2 (CBCT) fixture in the SynthRAD2025 layout and optional synthetic predictions."""
     rng = np.random.default_rng(seed)
     root = Path(root)
     case_ids = []
     for region in regions:
         for center in centers:
             for number in range(1, cases_per_stratum + 1):
-                case_id = f"1{region}{center}{number:03d}"
-                directory = root / "Task1" / region / case_id
+                case_id = f"{task}{region}{center}{number:03d}"
+                directory = root / f"Task{task}" / region / case_id
                 ct, mask = synthetic_ct(region, shape_yx, n_slices, rng)
                 write_volume(ct, directory / "ct.mha", spacing=SPACING_XYZ)
                 write_volume(mask.astype(np.uint8), directory / "mask.mha", spacing=SPACING_XYZ)
-                write_volume(synthetic_mr(ct, mask, rng), directory / "mr.mha", spacing=SPACING_XYZ)
+                if task == "1":
+                    write_volume(synthetic_mr(ct, mask, rng), directory / "mr.mha", spacing=SPACING_XYZ)
+                else:
+                    write_volume(synthetic_cbct(ct, mask, rng), directory / "cbct.mha", spacing=SPACING_XYZ)
                 if prediction_root is not None:
                     prediction = synthetic_prediction(ct, mask, rng)
                     write_volume(prediction, Path(prediction_root) / f"{case_id}.mha", spacing=SPACING_XYZ)

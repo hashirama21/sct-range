@@ -49,7 +49,7 @@ from .metrics import mae_hu, range_error, summarize
 from .models import _groups
 from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .scoring import crps_ensemble
-from .runs import ids_hash
+from .runs import artifact_dir, ids_hash
 from .training import (PatchSampler, _schedule, assign_folds, autocast_dtype, check_checkpoint, fold_seed,
                        load_progress, progress_key, save_progress, source_stack, uncrop)
 
@@ -481,7 +481,8 @@ def evaluate_generative(records: Sequence[CaseRecord], cache: VolumeCache, run_d
     rows, pits = [], []
     for record in records:
         path = eval_dir / f"{record.case_id}.json"
-        if path.exists():
+        mean_path = artifact_dir(run_dir) / f"{record.case_id}.mha"
+        if path.exists() and (not write_mean or mean_path.exists()):  # a missing mean is sampled again
             saved = json.loads(path.read_text())
             rows.append(saved["row"])
             pits.append(pd.Series(saved["pit"], name=record.case_id))
@@ -500,10 +501,10 @@ def evaluate_generative(records: Sequence[CaseRecord], cache: VolumeCache, run_d
         pit = np.bincount(ranks, minlength=n_samples + 1).tolist()
         path.write_text(json.dumps({"row": row, "pit": pit}, default=float))
         if write_mean:
-            (run_dir / "predictions").mkdir(exist_ok=True)
+            artifact_dir(run_dir).mkdir(parents=True, exist_ok=True)
             mean = uncrop(case, spr_mean(samples, hlut))
             hu = np.clip(np.rint(mean), *CT_RANGE_HU).astype(np.int16)
-            write_volume(hu, run_dir / "predictions" / f"{record.case_id}.mha", spacing=case.spacing,
+            write_volume(hu, mean_path, spacing=case.spacing,
                          origin=case.origin, direction=case.direction)
         rows.append(row)
         pits.append(pd.Series(pit, name=record.case_id))

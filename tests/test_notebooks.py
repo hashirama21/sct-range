@@ -18,8 +18,8 @@ def _code(path: Path) -> list[str]:
     return ["".join(c["source"]) for c in cells if c["cell_type"] == "code"]
 
 
-def _builder():
-    spec = importlib.util.spec_from_file_location("build_pipeline_notebook", REPO / "tools" / "build_pipeline_notebook.py")
+def _builder(name: str = "build_pipeline_notebook"):
+    spec = importlib.util.spec_from_file_location(name, REPO / "tools" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -45,9 +45,15 @@ def test_pipeline_notebook_is_up_to_date() -> None:
     assert committed == _builder().render(), "run `python tools/build_pipeline_notebook.py`"
 
 
-def test_pipeline_reads_no_name_before_defining_it() -> None:
+def test_s8_s10_notebook_is_up_to_date() -> None:
+    committed = (REPO / "notebooks" / "s8_s10_generality.ipynb").read_text(encoding="utf-8")
+    assert committed == _builder("build_s8_s10_notebook").render(), "run `python tools/build_s8_s10_notebook.py`"
+
+
+@pytest.mark.parametrize("name", ["s1_s7_pipeline.ipynb", "s8_s10_generality.ipynb"])
+def test_pipeline_reads_no_name_before_defining_it(name: str) -> None:
     defined = set(dir(builtins)) | {"display", "get_ipython"}
-    for index, code in enumerate(_code(REPO / "notebooks" / "s1_s7_pipeline.ipynb")):
+    for index, code in enumerate(_code(REPO / "notebooks" / name)):
         tree = ast.parse(code)
         local = set()
         for node in ast.walk(tree):

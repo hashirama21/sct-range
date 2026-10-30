@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "registered": "2026-10-28",
+  "scope": "Weeks 8-10 of the plan. Week 7 (generative arm on task 1) follows configs/s7_preregistration.json; this file fixes the rest before any real result exists.",
+  "s8": {
+    "generative_dose": {
+      "cases": "the frozen S6 dosimetry subset (outputs/s6/dosimetry_cases.json)",
+      "source": "SPR mean of the selected generator (K and N of the S7 main evaluation)",
+      "comparison": "proton gamma 2%/2mm of G against R3 seed 0 from S6, paired two-sided Wilcoxon",
+      "expectation": "no significant difference (the generator's mean equals the Bayes act at best)"
+    },
+    "task2_generative": {
+      "task": "2",
+      "eta": "the eta selected on task 1 (no new selection)",
+      "folds": 5,
+      "steps": 30000,
+      "cases": 100,
+      "n_samples": 16,
+      "n_steps": 16,
+      "subset_seed": 20261130,
+      "report": ["pcrps_mm", "pcrps_point_mm", "coverage90", "spread_mm", "unc_err_spearman"]
+    }
+  },
+  "s9_task2": {
+    "task": "2",
+    "arms": ["R1", "R2", "R3", "R4", "R5", "R6"],
+    "seed": 0,
+    "folds": 5,
+    "steps": 30000,
+    "rule": "configs/s4_preregistration.json applied unchanged to the task-2 development cases (one seed)",
+    "spectra": "configs/s3_preregistration.json applied unchanged to the R1 (L1 in HU) out-of-fold predictions of task 2",
+    "replication": "task 2 replicates task 1 when both pre-registered verdicts are identical"
+  },
+  "s9_tomography": {
+    "domain": "sparse-view parallel-beam CT on the reference CTs of the task-1 development cases",
+    "config": {
+      "pixel_mm": 2.0,
+      "size": 256,
+      "sparse_views": 30,
+      "eval_views": 180,
+      "photons": 100000.0,
+      "projection_weight": 0.0001,
+      "projection_angles": 8,
+      "steps": 20000,
+      "batch_size": 8
+    },
+    "losses": ["l1", "l2", "l2_proj"],
+    "folds": 2,
+    "seed": 0,
+    "evaluation": "central 16 slices of every task-1 development case, line integrals at the 180 held-out angles, in mm of water",
+    "alpha": 0.05,
+    "tests": {
+      "projection_loss_lowers_tail": {"column": "li_cvar_mm", "first": "l2_proj", "second": "l2", "alternative": "less"},
+      "projection_loss_image_cost": {"column": "mae_hu", "first": "l2_proj", "second": "l2", "alternative": "two-sided"},
+      "l1_vs_l2_signed_bias": {"column": "li_mean_signed_mm", "first": "l1", "second": "l2", "alternative": "two-sided"}
+    },
+    "multiplicity": "Holm over the three tests",
+    "expectation": "g is the identity, so l2 is already the Bayes act for squared line-integral loss; a gain of l2_proj tests Result A (spectral weighting under finite capacity) in isolation"
+  },
+  "s9_precipitation": {
+    "status": "not run",
+    "reason": "the plan schedules the basin-rainfall domain only if S6 finishes without delay, and it needs an external gauge/radar dataset that this repository does not provide; it is left to a later version rather than replaced by synthetic data"
+  },
+  "s10_ablations": {
+    "task": "1",
+    "seed": 0,
+    "folds": 5,
+    "steps": 30000,
+    "cases": "every task-1 development case",
+    "metrics": ["target_cvar_mm", "target_rms_mm", "mae_hu"],
+    "test": "paired two-sided Wilcoxon of each listed comparison, Holm within each family; median paired difference with a 95 % bootstrap interval",
+    "centers": "R5 and R6 of S4 seed 0 are the centre runs (reused when their checkpoints match)",
+    "families": {
+      "directions": {
+        "variants": {
+          "mixed (centre)": {"arm": "R5", "center": true},
+          "plan only": {"arm": "R5", "overrides": {"plan_angles": [0.0, 120.0, 240.0], "random_angles": 0}},
+          "random 3": {"arm": "R5", "overrides": {"plan_angles": [], "random_angles": 3}},
+          "random 6": {"arm": "R5", "overrides": {"plan_angles": [], "random_angles": 6}}
+        },
+        "comparisons": [["plan only", "random 3"], ["random 6", "mixed (centre)"], ["random 6", "random 3"]]
+      },
+      "segment": {
+        "variants": {
+          "whole chord (centre)": {"arm": "R5", "center": true},
+          "40 mm": {"arm": "R5", "overrides": {"segment_mm": 40.0}},
+          "80 mm": {"arm": "R5", "overrides": {"segment_mm": 80.0}}
+        },
+        "comparisons": [["40 mm", "whole chord (centre)"], ["80 mm", "whole chord (centre)"]]
+      },
+      "range_weight": {
+        "variants": {
+          "lambda 1e-4 (centre)": {"arm": "R5", "center": true},
+          "lambda 1e-5": {"arm": "R5", "overrides": {"range_weight": 1e-05}},
+          "lambda 1e-3": {"arm": "R5", "overrides": {"range_weight": 0.001}}
+        },
+        "comparisons": [["lambda 1e-5", "lambda 1e-4 (centre)"], ["lambda 1e-3", "lambda 1e-4 (centre)"]]
+      },
+      "risk_weight": {
+        "variants": {
+          "beta 1e-2 (centre)": {"arm": "R6", "center": true},
+          "beta 1e-3": {"arm": "R6", "overrides": {"risk_weight": 0.001}},
+          "beta 1e-1": {"arm": "R6", "overrides": {"risk_weight": 0.1}}
+        },
+        "comparisons": [["beta 1e-3", "beta 1e-2 (centre)"], ["beta 1e-1", "beta 1e-2 (centre)"]]
+      }
+    }
+  },
+  "s10_registration": {
+    "alternative": "IMPACT-registered CTs (Boussot et al., 2025; huggingface.co/datasets/VBoussot/synthrad2025-impact-registration), arranged in the SynthRAD2025 layout under SCT_IMPACT_ROOT",
+    "task": "1",
+    "arm": "R3",
+    "seed": 0,
+    "folds": 5,
+    "steps": 30000,
+    "cases": "task-1 development cases with an IMPACT CT on the same grid",
+    "matrix": "train on Elastix (S4 R3 seed 0) or IMPACT, test against the Elastix or the IMPACT reference CT",
+    "metrics": ["mae_hu", "target_rms_mm", "target_cvar_mm", "target_mean_signed_mm"],
+    "tests": [
+      ["trained on IMPACT, IMPACT test", "trained on Elastix, IMPACT test"],
+      ["trained on Elastix, Elastix test", "trained on IMPACT, Elastix test"]
+    ],
+    "note": "without SCT_IMPACT_ROOT this part is reported as not run"
+  }
+}

@@ -315,7 +315,15 @@ def plot_arm_pareto(summary: pd.DataFrame, x: str = "mae_hu", y: str = "target_c
             ax.plot([row[x], row[x]], [row[f"{y}_q25"], row[f"{y}_q75"]], color=color, linewidth=1.2, alpha=0.6)
         ax.plot(row[x], row[y], marker, color=color, markersize=9, markeredgecolor=SURFACE, markeredgewidth=2,
                 linestyle="none", label=role if seen[role] == 1 else None, zorder=3)
-        ax.annotate(arm, (row[x], row[y]), xytext=(7, 6), textcoords="offset points", color=INK, fontsize=9,
+        span_x = (summary[x].max() - summary[x].min()) or 1.0
+        span_y = (summary[y].max() - summary[y].min()) or 1.0
+        offset = (7, 6)
+        others = [((row[x] - o[x]) / span_x, (row[y] - o[y]) / span_y) for a, o in summary.iterrows() if a != arm]
+        if others:
+            dx, dy = min(others, key=lambda d: np.hypot(*d))
+            if np.hypot(dx, dy) < 0.12:  # label on the side away from the nearest arm
+                offset = (7 if dx >= 0 else -22, 6 if dy >= 0 else -14)
+        ax.annotate(arm, (row[x], row[y]), xytext=offset, textcoords="offset points", color=INK, fontsize=9,
                     fontweight="bold")
     ax.set_xlabel("median MAE in body (HU)")
     ax.set_ylabel("median CVaR90 |ΔWET| to distal edge (mm)")
@@ -525,6 +533,82 @@ def plot_sample_gallery(ct: np.ndarray, samples: np.ndarray, point: np.ndarray, 
     axes[4].set_title("sample std (HU)")
     fig.colorbar(image, ax=axes[4], fraction=0.046, pad=0.02)
     for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+# ------------------------------------------------------------------------------------- S9-S10 figures
+
+
+def plot_ablation_forest(table: pd.DataFrame, metrics: Sequence[str], labels: dict[str, str]) -> plt.Figure:
+    """Median paired difference (variant − reference) with its bootstrap interval, one panel per metric.
+
+    Rows are the comparisons of every family; filled markers have a Holm-adjusted p below 0.05.
+    """
+    comparisons = list(dict.fromkeys(zip(table["family"], table["variant"], table["reference"])))
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4.6 * len(metrics), 0.42 * len(comparisons) + 1.6),
+                             squeeze=False, sharey=True)
+    positions = np.arange(len(comparisons))[::-1]
+    for ax, metric in zip(axes[0], metrics):
+        for position, (family, variant, reference) in zip(positions, comparisons):
+            row = table[(table["family"] == family) & (table["variant"] == variant) & (table["reference"] == reference)
+                        & (table["metric"] == metric)]
+            if row.empty:
+                continue
+            row = row.iloc[0]
+            significant = np.isfinite(row["p_holm"]) and row["p_holm"] < 0.05
+            ax.plot([row["ci_low"], row["ci_high"]], [position, position], color=SERIES[0], linewidth=1.6)
+            ax.plot(row["median_difference"], position, "o", color=SERIES[0] if significant else SURFACE,
+                    markeredgecolor=SERIES[0], markeredgewidth=1.6, markersize=7, zorder=3)
+        ax.axvline(0.0, color=INK_SECONDARY, linewidth=0.8)
+        ax.set_xlabel(f"Δ {labels.get(metric, metric)}")
+        ax.grid(axis="y", visible=False)
+    axes[0][0].set_yticks(positions, [f"{f}: {v} − {r}" for f, v, r in comparisons])
+    axes[0][0].set_title("Ablations against their reference (filled: Holm p < 0.05)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_registration_matrix(matrices: dict[str, pd.DataFrame]) -> plt.Figure:
+    """Train-registration × test-registration medians, one annotated panel per metric."""
+    fig, axes = plt.subplots(1, len(matrices), figsize=(3.8 * len(matrices), 3.4), squeeze=False)
+    for ax, (label, matrix) in zip(axes[0], matrices.items()):
+        values = matrix.to_numpy(dtype=float)
+        image = ax.imshow(values, cmap=DOSE_MAP, vmin=np.nanmin(values) * 0.9, vmax=np.nanmax(values))
+        for (i, j), value in np.ndenumerate(values):
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center",
+                    color=SURFACE if value > np.nanmean(values) else INK, fontweight="bold")
+        ax.set_xticks(range(matrix.shape[1]), [f"test {c}" for c in matrix.columns])
+        ax.set_yticks(range(matrix.shape[0]), [f"train {r}" for r in matrix.index])
+        ax.grid(False)
+        ax.set_title(label)
+    fig.tight_layout()
+    return fig
+
+
+def plot_tomography_example(u: np.ndarray, reconstructions: dict[str, np.ndarray], body: np.ndarray) -> plt.Figure:
+    """Ground truth, then each reconstruction and its error (relative attenuation × 1000 ≈ HU), cropped to the body."""
+    rows, cols = np.nonzero(body > 0.5)
+    if rows.size:
+        margin = 8
+        window = (slice(max(rows.min() - margin, 0), rows.max() + margin + 1),
+                  slice(max(cols.min() - margin, 0), cols.max() + margin + 1))
+        u, body = u[window], body[window]
+        reconstructions = {name: image[window] for name, image in reconstructions.items()}
+    names = list(reconstructions)
+    fig, axes = plt.subplots(2, len(names) + 1, figsize=(3.0 * (len(names) + 1), 6.0))
+    axes[0, 0].imshow(u, cmap="gray", vmin=0, vmax=2.2)
+    axes[0, 0].set_title("reference (u = μ / μ_water)")
+    axes[1, 0].axis("off")
+    for column, name in enumerate(names, start=1):
+        axes[0, column].imshow(reconstructions[name], cmap="gray", vmin=0, vmax=2.2)
+        axes[0, column].set_title(name)
+        error = np.where(body > 0.5, 1000.0 * (reconstructions[name] - u), np.nan)
+        image = axes[1, column].imshow(error, cmap=DIVERGING, vmin=-200, vmax=200)
+        axes[1, column].set_title(f"{name} − reference")
+    fig.colorbar(image, ax=axes[1, -1], fraction=0.046, pad=0.02, label="×1000 (≈ HU)")
+    for ax in axes.flat:
         ax.axis("off")
     fig.tight_layout()
     return fig

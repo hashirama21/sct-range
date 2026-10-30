@@ -41,7 +41,7 @@ from .losses import fz_upper_tail_loss, ray_risk
 from .models import UNet2d
 from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .projection import ParallelBeamProjector
-from .runs import completion, ids_hash, mark_complete, mark_incomplete, run_complete
+from .runs import artifact_dir, completion, ids_hash, mark_complete, mark_incomplete, run_complete
 from .split import load_split
 
 LOSSES = ("l1_hu", "l2_hu", "l2_spr")
@@ -54,6 +54,7 @@ ARMS: dict[str, dict] = {
 }
 POSTHOC_ARMS = {"R4": "R3"}
 _RUNTIME_FIELDS = ("device", "amp", "log_every")
+_LATE_FIELDS = {"segment_mm": 0.0}  # field -> neutral value (added in 0.7, S10 ablations)
 _RISK_DENSITY_INIT = 0.01  # mm of water per mm of path, roughly a 1 mm tail over 10 cm
 
 
@@ -82,12 +83,15 @@ class TrainConfig:
     plan_angles: tuple[float, ...] = field(default=(0.0, 120.0, 240.0))
     random_angles: int = 3
     min_path_mm: float = 20.0
+    segment_mm: float = 0.0
 
     def __post_init__(self) -> None:
         if self.loss not in LOSSES:
             raise ValueError(f"loss must be one of {LOSSES}")
         if self.range_weight < 0 or self.risk_weight < 0:
             raise ValueError("range_weight and risk_weight must be non-negative")
+        if self.segment_mm < 0:
+            raise ValueError("segment_mm must be non-negative (0 = whole chord)")
         if not 0.0 < self.risk_level < 1.0:
             raise ValueError("risk_level must be in (0, 1)")
         object.__setattr__(self, "plan_angles", tuple(float(a) for a in self.plan_angles))
@@ -107,8 +111,13 @@ class TrainConfig:
         return self.range_weight > 0 or self.risk_weight > 0
 
     def comparable(self) -> dict:
-        """Fields that define the experiment (runtime-only fields removed), JSON-normalised."""
-        values = {k: v for k, v in asdict(self).items() if k not in _RUNTIME_FIELDS}
+        """Fields that define the experiment (runtime-only fields removed), JSON-normalised.
+
+        Fields added after runs were trained are left out while they keep their neutral value, so the checkpoints,
+        completion markers and in-fold progress of earlier runs stay valid.
+        """
+        values = {k: v for k, v in asdict(self).items()
+                  if k not in _RUNTIME_FIELDS and not (k in _LATE_FIELDS and v == _LATE_FIELDS[k])}
         return json.loads(json.dumps(values))
 
 
@@ -139,13 +148,22 @@ def beam_angles(config: TrainConfig, rng: np.random.Generator) -> tuple[float, .
     return config.plan_angles + tuple(rng.uniform(0.0, 360.0, config.random_angles).tolist())
 
 
+def truncate_segments(weights: torch.Tensor, length_px: float) -> torch.Tensor:
+    """Keep, on every ray (depth along dim -2), the first ``length_px`` samples after the entry point."""
+    rows = torch.arange(weights.shape[-2], device=weights.device).view(-1, 1)
+    entry = torch.where(weights, rows, weights.shape[-2]).amin(dim=-2, keepdim=True)
+    return weights & (rows < entry + length_px)
+
+
 def training_objective(output: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor, config: TrainConfig,
                        hlut: HLUT, angles: tuple[float, ...] = (), spacing_mm: float = 1.0
                        ) -> tuple[torch.Tensor, dict[str, float]]:
     """Point loss, plus the projected range term and the risk-head score when enabled.
 
     ``output`` is ``(B, C, H, W)``: channel 0 the encoded CT, channels 1-2 the VaR and ES-excess densities.
-    Segments are the chords of the body inside each patch; rays shorter than ``min_path_mm`` are ignored.
+    Segments are the chords of the body inside each patch, or with ``segment_mm > 0`` their first ``segment_mm`` from
+    the entry point (a fixed depth, the training analogue of entry-to-distal-edge segments); rays shorter than
+    ``min_path_mm`` are ignored.
     The risk head is scored on the detached range error, so it never pushes the sCT itself.
     """
     pred_hu = decode_ct(output[:, :1].float())
@@ -158,6 +176,8 @@ def training_objective(output: torch.Tensor, targets: torch.Tensor, masks: torch
     projector = ParallelBeamProjector(tuple(body.shape[-2:]), angles, spacing_mm, device=body.device)
     with torch.no_grad():
         weights, valid = projector.segment_weights(body)
+        if config.segment_mm > 0:
+            weights = truncate_segments(weights, config.segment_mm / spacing_mm)
         valid &= projector.path_length(weights) >= config.min_path_mm
     if not bool(valid.any()):
         return loss, parts
@@ -477,7 +497,7 @@ def _write_risk(risk: np.ndarray, case: CachedCase, output_dir: Path) -> None:
     geometry = dict(spacing=case.spacing, origin=case.origin, direction=case.direction)
     for name, density in zip(("var", "excess"), uncrop(case, risk, fill=0.0)):
         rounded = density.astype(np.float16).astype(np.float32)
-        write_volume(rounded, output_dir / "risk" / f"{case.case_id}_{name}.mha", **geometry)
+        write_volume(rounded, artifact_dir(output_dir, "risk") / f"{case.case_id}_{name}.mha", **geometry)
 
 
 @dataclass
@@ -506,7 +526,8 @@ def _start_run(records: list[CaseRecord], config: TrainConfig, n_folds: int, out
             and marker.get("config") == config.comparable()
             and marker.get("folds") == n_folds and all((output_dir / f"fold{k}.pt").exists() for k in range(n_folds))):
         return _Run(config, output_dir, folds, [], True)
-    (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir(output_dir).mkdir(parents=True, exist_ok=True)
     mark_incomplete(output_dir)  # set again once every prediction is written
     (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2))
     pd.DataFrame(sorted(folds.items()), columns=["case_id", "fold"]).to_csv(output_dir / "folds.csv", index=False)
@@ -531,7 +552,7 @@ def _predict_run(run: _Run, cache: VolumeCache, n_folds: int, device: str) -> No
                 _write_risk(risk, case, run.output_dir)
             else:
                 sct = predict_case(model, case, run.config.context, device)
-            _write_prediction(sct, case, run.output_dir / "predictions" / f"{case_id}.mha")
+            _write_prediction(sct, case, artifact_dir(run.output_dir) / f"{case_id}.mha")
         del model
     mark_complete(run.output_dir, run.folds, config=run.config.comparable(), folds=n_folds)
     run.finished = True

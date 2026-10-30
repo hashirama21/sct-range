@@ -19,7 +19,7 @@ from .data import CaseRecord, load_case, read_prediction, read_volume, write_vol
 from .hlut import HLUT
 from .metrics import TISSUE_EDGES_HU
 from .normalization import CT_RANGE_HU
-from .runs import files_signature, mark_complete, mark_incomplete, run_complete
+from .runs import artifact_dir, files_signature, mark_complete, mark_incomplete, run_complete
 
 
 def tissue_classes(hu: np.ndarray, edges_hu: Sequence[float] = TISSUE_EDGES_HU) -> np.ndarray:
@@ -63,7 +63,7 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
     if not run_complete(source_dir, ids):
         raise FileNotFoundError(f"{source_dir} has not finished (complete.json missing or predictions absent)")
     signature = {"source": files_signature([source_dir / "folds.csv",
-                                            *(source_dir / "predictions" / f"{i}.mha" for i in ids)]),
+                                            *(artifact_dir(source_dir) / f"{i}.mha" for i in ids)]),
                  "edges_hu": [float(e) for e in edges_hu], "hlut": hlut.fingerprint()}
     if run_complete(output_dir, ids) and (output_dir / "offsets.csv").exists() and \
             json.loads((output_dir / "complete.json").read_text()).get("signature") == json.loads(json.dumps(signature)):
@@ -71,7 +71,7 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
     mark_incomplete(output_dir)
 
     def prediction(record: CaseRecord, shape: tuple[int, ...]) -> np.ndarray:
-        return read_prediction(source_dir / "predictions" / f"{record.case_id}.mha", shape)
+        return read_prediction(artifact_dir(source_dir) / f"{record.case_id}.mha", shape)
 
     sums, counts = {}, {}
     for record in records:
@@ -87,13 +87,14 @@ def crossfit_bias_correction(records: list[CaseRecord], source_dir: str | Path, 
         count = np.sum([counts[i] for i in others], axis=0) if others else np.zeros(len(labels))
         offsets[fold] = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
 
-    (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir(output_dir).mkdir(parents=True, exist_ok=True)
     for record in records:
-        volume = read_volume(source_dir / "predictions" / f"{record.case_id}.mha")
+        volume = read_volume(artifact_dir(source_dir) / f"{record.case_id}.mha")
         mask = load_case(record, ("mask",))["mask"].array
         corrected = apply_bias(volume.array, mask, offsets[folds[record.case_id]], hlut, edges_hu)
         hu = np.clip(np.rint(corrected), *CT_RANGE_HU).astype(np.int16)  # same storage as crossfit predictions
-        write_volume(hu, output_dir / "predictions" / f"{record.case_id}.mha", like=volume)
+        write_volume(hu, artifact_dir(output_dir) / f"{record.case_id}.mha", like=volume)
 
     frame = pd.DataFrame.from_dict(offsets, orient="index", columns=labels).rename_axis("fold")
     pd.read_csv(source_dir / "folds.csv").to_csv(output_dir / "folds.csv", index=False)

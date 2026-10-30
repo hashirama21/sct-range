@@ -15,6 +15,31 @@ from pathlib import Path
 from typing import Any
 
 COMPLETE = "complete.json"
+_ARTIFACT_ROOTS: list[tuple[Path, Path]] = []
+
+
+def redirect_artifacts(persistent_root: str | Path, scratch_root: str | Path) -> None:
+    """Keep the bulky outputs (``predictions/``, ``risk/``) of every run under ``persistent_root`` on ``scratch_root``.
+
+    On Colab and Kaggle the persistent outputs (Drive, ``/kaggle/working``, 20 GB) hold checkpoints, in-fold progress,
+    histories and evaluations, which a new session needs; out-of-fold predictions only feed evaluations cached with
+    the outputs, and are rebuilt from the checkpoints when a later session needs them again (a run whose predictions
+    are missing is not complete, so ``crossfit_runs`` predicts it again without training). Without a call, every
+    artefact stays inside its run directory.
+    """
+    entry = (Path(persistent_root).resolve(), Path(scratch_root).resolve())
+    if entry not in _ARTIFACT_ROOTS:
+        _ARTIFACT_ROOTS.append(entry)
+
+
+def artifact_dir(run_dir: str | Path, name: str = "predictions") -> Path:
+    """Where the ``name`` folder of ``run_dir`` lives (``<run_dir>/<name>`` unless redirected)."""
+    run_dir = Path(run_dir)
+    resolved = run_dir.resolve()
+    for persistent, scratch in _ARTIFACT_ROOTS:
+        if resolved == persistent or persistent in resolved.parents:
+            return scratch / resolved.relative_to(persistent) / name
+    return run_dir / name
 
 
 def ids_hash(case_ids: Iterable[str]) -> str:
@@ -66,7 +91,7 @@ def run_complete(run_dir: str | Path, case_ids: Iterable[str]) -> bool:
     """True when the run finished for every case of ``case_ids`` and each prediction is on disk."""
     run_dir, case_ids = Path(run_dir), set(case_ids)
     return (bool(case_ids) and case_ids <= completed_cases(run_dir)
-            and all((run_dir / "predictions" / f"{case_id}.mha").exists() for case_id in case_ids))
+            and all((artifact_dir(run_dir) / f"{case_id}.mha").exists() for case_id in case_ids))
 
 
 def cached_result(path: str | Path, key: Any, compute: Callable[[], Any]) -> Any:
