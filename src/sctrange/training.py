@@ -24,7 +24,7 @@ import multiprocessing
 import time
 from collections import defaultdict
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -41,7 +41,7 @@ from .losses import fz_upper_tail_loss, ray_risk
 from .models import UNet2d
 from .normalization import CT_RANGE_HU, OUTSIDE_HU, decode_ct, encode_ct
 from .projection import ParallelBeamProjector
-from .runs import ids_hash, mark_complete, mark_incomplete
+from .runs import completion, ids_hash, mark_complete, mark_incomplete, run_complete
 from .split import load_split
 
 LOSSES = ("l1_hu", "l2_hu", "l2_spr")
@@ -471,6 +471,134 @@ def _write_prediction(sct: np.ndarray, case: CachedCase, path: Path) -> None:
     write_volume(hu, path, spacing=case.spacing, origin=case.origin, direction=case.direction)
 
 
+def _write_risk(risk: np.ndarray, case: CachedCase, output_dir: Path) -> None:
+    """Risk densities rounded to float16 precision (relative error below 5e-4) but kept as float32 files: the zeroed
+    low mantissa bits halve the compressed size, and readers are unchanged."""
+    geometry = dict(spacing=case.spacing, origin=case.origin, direction=case.direction)
+    for name, density in zip(("var", "excess"), uncrop(case, risk, fill=0.0)):
+        rounded = density.astype(np.float16).astype(np.float32)
+        write_volume(rounded, output_dir / "risk" / f"{case.case_id}_{name}.mha", **geometry)
+
+
+@dataclass
+class _Run:
+    """One cross-fitted run of ``crossfit_runs``: its folds, the folds left to train, and whether it is finished."""
+    config: TrainConfig
+    output_dir: Path
+    folds: dict[str, int]
+    pending: list[int]
+    finished: bool
+
+    def training_ids(self, fold: int) -> list[str]:
+        return [case_id for case_id, k in self.folds.items() if k != fold]
+
+    def checkpoint(self, fold: int) -> Path:
+        return self.output_dir / f"fold{fold}.pt"
+
+
+def _start_run(records: list[CaseRecord], config: TrainConfig, n_folds: int, output_dir: str | Path) -> _Run:
+    """Prepare ``output_dir``; a run already complete with this configuration is left untouched (its predictions are
+    not rewritten, so the evaluations cached against them and the R4 correction stay valid)."""
+    output_dir = Path(output_dir)
+    folds = assign_folds(records, n_folds, config.seed)
+    marker = completion(output_dir)
+    if (run_complete(output_dir, folds) and set(marker.get("cases", ())) == set(folds)  # same pool, not a subset
+            and marker.get("config") == config.comparable()
+            and marker.get("folds") == n_folds and all((output_dir / f"fold{k}.pt").exists() for k in range(n_folds))):
+        return _Run(config, output_dir, folds, [], True)
+    (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    mark_incomplete(output_dir)  # set again once every prediction is written
+    (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2))
+    pd.DataFrame(sorted(folds.items()), columns=["case_id", "fold"]).to_csv(output_dir / "folds.csv", index=False)
+    run = _Run(config, output_dir, folds, [], False)
+    for fold in range(n_folds):
+        if run.checkpoint(fold).exists():
+            _load_checkpoint(run.checkpoint(fold), config, run.training_ids(fold))  # refuses another configuration
+        else:
+            run.pending.append(fold)
+    return run
+
+
+def _predict_run(run: _Run, cache: VolumeCache, n_folds: int, device: str) -> None:
+    """Out-of-fold predictions of every case (and risk maps when the model has a risk head), then the run is complete."""
+    with_risk = run.config.out_channels > 1
+    for fold in range(n_folds):
+        model = _load_checkpoint(run.checkpoint(fold), replace(run.config, device=device), run.training_ids(fold))
+        for case_id in (case_id for case_id, k in run.folds.items() if k == fold):
+            case = cache.load(case_id)
+            if with_risk:
+                sct, risk = predict_case(model, case, run.config.context, device, with_risk=True)
+                _write_risk(risk, case, run.output_dir)
+            else:
+                sct = predict_case(model, case, run.config.context, device)
+            _write_prediction(sct, case, run.output_dir / "predictions" / f"{case_id}.mha")
+        del model
+    mark_complete(run.output_dir, run.folds, config=run.config.comparable(), folds=n_folds)
+    run.finished = True
+
+
+_WORKER_DEVICE: str | None = None
+
+
+def _claim_device(devices) -> None:
+    """Pool initializer: each worker process takes one device for its lifetime."""
+    global _WORKER_DEVICE
+    _WORKER_DEVICE = devices.get()
+
+
+def _train_fold_on_worker(*args) -> pd.DataFrame:
+    return train_fold(*args, _WORKER_DEVICE)
+
+
+def crossfit_runs(records: list[CaseRecord], cache: VolumeCache, runs: Sequence[tuple[TrainConfig, str | Path]],
+                  hlut: HLUT, n_folds: int, devices: Sequence[str] | None = None) -> list[pd.DataFrame]:
+    """Several cross-fitted runs (e.g. every arm and seed of S4) whose missing folds share one queue.
+
+    Folds are queued in the order of ``runs``, then by fold. With several ``devices`` (``["cuda:0", "cuda:1"]`` on two
+    T4) one process per device takes the next fold as soon as it is free, so no device waits for the last fold of a
+    run; a run's predictions are written as soon as its last fold is trained (on the first device, while the other
+    processes keep training), so an interrupted queue leaves every run it finished usable. If a fold fails, the queued
+    folds are cancelled, the running ones finish (their checkpoints are kept), and the error is raised. Returns the
+    folds of each run (``case_id``, ``fold``), as ``crossfit``.
+    """
+    devices = list(devices or [runs[0][0].device])
+    states = [_start_run(records, config, n_folds, output_dir) for config, output_dir in runs]
+    for run in states:
+        if not run.finished and not run.pending:  # trained, predictions interrupted
+            _predict_run(run, cache, n_folds, devices[0])
+    jobs = [(run, fold) for run in states for fold in run.pending]
+
+    def done(run: _Run, fold: int, history: pd.DataFrame) -> None:
+        _append_history(run.output_dir / "history.csv", history)
+        run.pending.remove(fold)
+        if not run.pending:
+            _predict_run(run, cache, n_folds, devices[0])
+
+    def arguments(run: _Run, fold: int) -> tuple:
+        return cache, run.training_ids(fold), run.config, hlut, fold, run.checkpoint(fold)
+
+    if len(devices) > 1 and len(jobs) > 1:
+        context = multiprocessing.get_context("spawn")  # CUDA cannot be shared with forked processes
+        with context.Manager() as manager:
+            free = manager.Queue()
+            for device in devices:
+                free.put(device)
+            pool = ProcessPoolExecutor(max_workers=len(devices), mp_context=context, initializer=_claim_device,
+                                       initargs=(free,))
+            try:
+                futures = {pool.submit(_train_fold_on_worker, *arguments(run, fold)): (run, fold) for run, fold in jobs}
+                for future in as_completed(futures):
+                    done(*futures[future], future.result())
+            except BaseException:
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
+            pool.shutdown(wait=True)
+    else:
+        for run, fold in jobs:
+            done(run, fold, train_fold(*arguments(run, fold), devices[0]))
+    return [pd.DataFrame(sorted(run.folds.items()), columns=["case_id", "fold"]) for run in states]
+
+
 def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig, hlut: HLUT, n_folds: int,
              output_dir: str | Path, devices: Sequence[str] | None = None) -> pd.DataFrame:
     """Train one model per fold on the other folds; write out-of-fold predictions and checkpoints.
@@ -478,60 +606,11 @@ def crossfit(records: list[CaseRecord], cache: VolumeCache, config: TrainConfig,
     Layout: ``<output_dir>/predictions/<case_id>.mha`` (int16 HU), ``fold<k>.pt``, ``history.csv``, ``folds.csv``,
     ``config.json``, and ``risk/<case_id>_{var,excess}.mha`` when the model has a risk head. Folds whose checkpoint
     exists are reused (after checking that it was trained with the same configuration), so interrupted runs resume;
-    the history is appended after every fold. With several ``devices`` (e.g. ``["cuda:0", "cuda:1"]`` on two T4),
-    missing folds are trained in parallel, one process per device; prediction then runs on the first device.
+    the history is appended after every fold, and a run already complete with this configuration is not predicted
+    again. With several ``devices`` (e.g. ``["cuda:0", "cuda:1"]`` on two T4), missing folds are trained in parallel,
+    one process per device; prediction then runs on the first device. ``crossfit_runs`` queues several runs at once.
     """
-    output_dir = Path(output_dir)
-    devices = list(devices or [config.device])
-    (output_dir / "predictions").mkdir(parents=True, exist_ok=True)
-    mark_incomplete(output_dir)  # set again once every prediction is written
-    (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2))
-    folds = assign_folds(records, n_folds, config.seed)
-    frame = pd.DataFrame(sorted(folds.items()), columns=["case_id", "fold"])
-    frame.to_csv(output_dir / "folds.csv", index=False)
-    history_path = output_dir / "history.csv"
-    with_risk = config.out_channels > 1
-
-    def training_ids(fold: int) -> list[str]:
-        return [r.case_id for r in records if folds[r.case_id] != fold]
-
-    def job(fold: int, device: str) -> tuple:
-        return cache, training_ids(fold), config, hlut, fold, output_dir / f"fold{fold}.pt", device
-
-    pending = []
-    for fold in range(n_folds):
-        checkpoint = output_dir / f"fold{fold}.pt"
-        if checkpoint.exists():
-            _load_checkpoint(checkpoint, config, training_ids(fold))  # refuses another configuration or case set
-        else:
-            pending.append(fold)
-    if len(devices) > 1 and len(pending) > 1:
-        context = multiprocessing.get_context("spawn")  # CUDA cannot be shared with forked processes
-        for start in range(0, len(pending), len(devices)):
-            wave = pending[start:start + len(devices)]
-            with ProcessPoolExecutor(max_workers=len(wave), mp_context=context) as pool:
-                futures = [pool.submit(train_fold, *job(fold, device)) for fold, device in zip(wave, devices)]
-                for future in futures:
-                    _append_history(history_path, future.result())
-    else:
-        for fold in pending:
-            _append_history(history_path, train_fold(*job(fold, devices[0])))
-
-    device = devices[0]
-    for fold in range(n_folds):
-        model = _load_checkpoint(output_dir / f"fold{fold}.pt", replace(config, device=device), training_ids(fold))
-        for case_id in (r.case_id for r in records if folds[r.case_id] == fold):
-            case = cache.load(case_id)
-            if with_risk:
-                sct, risk = predict_case(model, case, config.context, device, with_risk=True)
-                geometry = dict(spacing=case.spacing, origin=case.origin, direction=case.direction)
-                for name, density in zip(("var", "excess"), uncrop(case, risk, fill=0.0)):
-                    write_volume(density, output_dir / "risk" / f"{case_id}_{name}.mha", **geometry)
-            else:
-                sct = predict_case(model, case, config.context, device)
-            _write_prediction(sct, case, output_dir / "predictions" / f"{case_id}.mha")
-    mark_complete(output_dir, folds, config=config.comparable(), folds=n_folds)
-    return frame
+    return crossfit_runs(records, cache, [(config, output_dir)], hlut, n_folds, devices)[0]
 
 
 def main(argv: list[str] | None = None) -> None:

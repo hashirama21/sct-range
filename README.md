@@ -48,6 +48,11 @@ a stage can be resumed in either.
 | local | `data/synthrad2025`, `outputs/` | `outputs/` | every visible GPU |
 
 - **Two GPUs** (Kaggle T4 × 2): missing folds train in parallel, one process per GPU; prediction runs on the first.
+  S4 trains seed by seed, and within a seed the folds of the five arms share one queue (`crossfit_runs`), so a free GPU
+  takes the next fold. Its verdict uses the seeds whose six arms are complete and is marked preliminary with fewer than
+  the three pre-registered seeds: `SEEDS = "0"` gives one after the first seed, then `"0,1,2"` reuses those runs.
+- **OpenBLAS**: the setup cell sets `OPENBLAS_NUM_THREADS=1` (multithreaded products of OpenBLAS 0.3.27 can be wrong,
+  and pyRadPlan runs on NumPy); S6 parallelises over cases with `WORKERS` instead.
 - **T4**: no native bfloat16, so training uses float16 autocast with loss scaling (bfloat16 on Ampere and newer).
 - **Sessions end**: every fold is checkpointed in the outputs, and a fold in training saves its full state every 1000 steps; rerunning the notebook resumes where it stopped (evaluations are cached per case). On
   Colab the outputs stay in Drive. On Kaggle, *Save Version* keeps `/kaggle/working`; to continue, add that version's

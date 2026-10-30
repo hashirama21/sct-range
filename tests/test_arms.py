@@ -24,6 +24,7 @@ from sctrange.training import (
     beam_angles,
     build_model,
     crossfit,
+    crossfit_runs,
     main,
     training_objective,
 )
@@ -217,6 +218,28 @@ def test_parallel_folds_match_the_sequential_run(fixture_root: Path, hlut: HLUT)
 
     stored = sitk.ReadImage(str(parallel / "predictions" / f"{records[0].case_id}.mha"))
     assert stored.GetPixelID() == sitk.sitkInt16
+
+
+def test_queued_runs_match_separate_runs_and_complete_runs_are_not_rewritten(fixture_root: Path, hlut: HLUT) -> None:
+    records = discover_cases(fixture_root / "data")
+    cache = VolumeCache(fixture_root / "cache")
+    cache.build(records)
+    configs = [arm_config(arm, **{**TINY, "steps": 6, "log_every": 3}) for arm in ("R3", "R6")]
+    separate = [fixture_root / "runs" / "separate" / config.loss / str(config.out_channels) for config in configs]
+    queued = [fixture_root / "runs" / "queued" / config.loss / str(config.out_channels) for config in configs]
+    for config, out in zip(configs, separate):
+        crossfit(records, cache, config, hlut, 2, out)
+    crossfit_runs(records, cache, list(zip(configs, queued)), hlut, 2, devices=["cpu", "cpu"])
+    for a, b in zip(separate, queued):
+        assert run_complete(b, [r.case_id for r in records])
+        assert set(pd.read_csv(b / "history.csv")["fold"]) == {0, 1}
+        for path in (a / "predictions").glob("*.mha"):
+            np.testing.assert_array_equal(read_volume(path).array, read_volume(b / "predictions" / path.name).array)
+    var = read_volume(queued[1] / "risk" / f"{records[0].case_id}_var.mha").array
+    np.testing.assert_array_equal(var, var.astype(np.float16).astype(np.float32))  # stored at float16 precision
+    stamps = {p: p.stat().st_mtime_ns for p in queued[0].rglob("*") if p.is_file()}
+    crossfit_runs(records, cache, list(zip(configs, queued)), hlut, 2)
+    assert {p: p.stat().st_mtime_ns for p in queued[0].rglob("*") if p.is_file()} == stamps
 
 
 def test_build_model_initial_outputs() -> None:

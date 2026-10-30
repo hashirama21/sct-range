@@ -52,9 +52,14 @@ def mark_complete(run_dir: str | Path, case_ids: Iterable[str], **extra: Any) ->
     (Path(run_dir) / COMPLETE).write_text(json.dumps(payload, indent=2, default=str))
 
 
-def completed_cases(run_dir: str | Path) -> set[str]:
+def completion(run_dir: str | Path) -> dict[str, Any]:
+    """The ``complete.json`` marker of a finished run (cases and the extra fields of ``mark_complete``), else ``{}``."""
     path = Path(run_dir) / COMPLETE
-    return set(json.loads(path.read_text())["cases"]) if path.exists() else set()
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def completed_cases(run_dir: str | Path) -> set[str]:
+    return set(completion(run_dir).get("cases", ()))
 
 
 def run_complete(run_dir: str | Path, case_ids: Iterable[str]) -> bool:
