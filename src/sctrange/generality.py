@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,7 +50,7 @@ def registration_overlay(original_root: str | Path, alternative_root: str | Path
             link = target / source.name
             if link.is_symlink() or link.exists():
                 link.unlink()
-            os.symlink((alternative if source.name == "ct.mha" else source).resolve(), link)
+            _link((alternative if source.name == "ct.mha" else source).resolve(), link)
         rows.append({"case_id": case_id, "kept": True, "reason": ""})
     return pd.DataFrame(rows)
 
@@ -61,11 +62,30 @@ def prediction_shim(predictions_dir: str | Path, shim_root: str | Path, arm: str
     target.mkdir(parents=True, exist_ok=True)
     link = target / "predictions"
     if link.is_symlink() or link.exists():
-        if link.is_symlink() and link.resolve() == Path(predictions_dir).resolve():
+        if link.resolve() == Path(predictions_dir).resolve():
             return Path(shim_root)
-        link.unlink()
-    os.symlink(Path(predictions_dir).resolve(), link)
+        link.rmdir() if link.is_dir() and not link.is_symlink() else link.unlink()  # a junction is removed by rmdir
+    _link(Path(predictions_dir).resolve(), link)
     return Path(shim_root)
+
+
+def _link(source: Path, link: Path) -> None:
+    """A symbolic link; where Windows refuses one (no developer mode), a junction for a folder, else a hard link or,
+    across volumes, a copy."""
+    try:
+        os.symlink(source, link, target_is_directory=source.is_dir())
+    except OSError:
+        if os.name != "nt":
+            raise
+        if source.is_dir():
+            import _winapi
+
+            _winapi.CreateJunction(str(source), str(link))
+            return
+        try:
+            os.link(source, link)
+        except OSError:
+            shutil.copy2(source, link)
 
 
 # -------------------------------------------------------------------------------------------------- ablations
